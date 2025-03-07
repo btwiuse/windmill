@@ -21,7 +21,7 @@ use windmill_common::{
     error::{self, Error},
     jobs::{JobKind, QueuedJob},
     utils::WarnAfterExt,
-    worker::{to_raw_value, WORKER_GROUP},
+    worker::{to_raw_value, ConnectionMode, WORKER_GROUP},
     DB,
 };
 
@@ -55,7 +55,7 @@ pub fn start_background_processor(
     same_worker_queue_size: Arc<AtomicU16>,
     job_completed_processor_is_done: Arc<AtomicBool>,
     base_internal_url: String,
-    db: DB,
+    db: ConnectionMode,
     worker_dir: String,
     same_worker_tx: SameWorkerSender,
     worker_name: String,
@@ -568,7 +568,7 @@ pub async fn handle_job_error(
             &job.id,
             &job.workspace_id,
             format!("Unexpected error during job execution:\n{err:#?}"),
-            db,
+            db.clone(),
         )
         .await;
         add_completed_job_error(

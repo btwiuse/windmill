@@ -5,6 +5,7 @@ use regex::Regex;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use sqlx::{Pool, Postgres};
 use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
@@ -102,9 +103,87 @@ lazy_static::lazy_static! {
 
     // Features flags:
     pub static ref DISABLE_FLOW_SCRIPT: bool = std::env::var("DISABLE_FLOW_SCRIPT").ok().is_some_and(|x| x == "1" || x == "true");
+
+    pub static ref ROOT_STANDALONE_BUNDLE_DIR: String = format!("{}/.windmill/standalone_bundle/", std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()));
 }
 
+pub const ROOT_CACHE_NOMOUNT_DIR: &str = concatcp!(TMP_DIR, "/cache_nomount/");
+
 pub static MIN_VERSION_IS_LATEST: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone)]
+pub enum ConnectionMode {
+    Sql(Pool<Postgres>),
+    Http,
+}
+
+impl ConnectionMode {
+    pub async fn push_job(&self, job: &Job) {
+        match self {
+            ConnectionMode::Sql(pool) => {
+                let tx = PushIsolationLevel::IsolatedRoot(db.clone());
+                let ehm = HashMap::new();
+                let (uuid, inner_tx) = push(
+                    &db,
+                    tx,
+                    "admins",
+                    windmill_common::jobs::JobPayload::Code(windmill_common::jobs::RawCode {
+                        hash: None,
+                        content: content.clone(),
+                        path: Some(format!("init_script_{worker_name}")),
+                        language: ScriptLang::Bash,
+                        lock: None,
+                        custom_concurrency_key: None,
+                        concurrent_limit: None,
+                        concurrency_time_window_s: None,
+                        cache_ttl: None,
+                        dedicated_worker: None,
+                    }),
+                    PushArgs::from(&ehm),
+                    worker_name,
+                    "worker@windmill.dev",
+                    SUPERADMIN_SECRET_EMAIL.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    true,
+                    None,
+                    true,
+                    Some("init_script".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+                inner_tx.commit().await?;
+            }
+            ConnectionMode::Http => tracing::error!("Cannot push job in http mode"),
+        }
+    }
+}
+
+impl From<Pool<Postgres>> for ConnectionMode {
+    fn from(value: Pool<Postgres>) -> Self {
+        ConnectionMode::Sql(value)
+    }
+}
+
+impl From<&Pool<Postgres>> for ConnectionMode {
+    fn from(value: &Pool<Postgres>) -> Self {
+        ConnectionMode::Sql(value.clone())
+    }
+}
+
+impl std::borrow::Borrow<ConnectionMode> for Pool<Postgres> {
+    fn borrow(&self) -> &ConnectionMode {
+        // This is safe because we never expose the reference and immediately convert it
+        unsafe { std::mem::transmute(self) }
+    }
+}
 
 fn format_pull_query(peek: String) -> String {
     let r = format!(
@@ -671,7 +750,7 @@ pub async fn update_min_version<'c, E: sqlx::Executor<'c, Database = sqlx::Postg
     min_version >= cur_version
 }
 
-pub async fn update_ping(worker_instance: &str, worker_name: &str, ip: &str, db: &DB) {
+pub async fn update_ping(worker_instance: &str, worker_name: &str, ip: &str, db: &ConnectionMode) {
     let (tags, dw) = {
         let wc = WORKER_CONFIG.read().await.clone();
         (
@@ -685,21 +764,28 @@ pub async fn update_ping(worker_instance: &str, worker_name: &str, ip: &str, db:
     let vcpus = get_vcpus();
     let memory = get_memory();
 
-    sqlx::query!(
-        "INSERT INTO worker_ping (worker_instance, worker, ip, custom_tags, worker_group, dedicated_worker, wm_version, vcpus, memory) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (worker) DO UPDATE set ip = $3, custom_tags = $4, worker_group = $5",
-        worker_instance,
-        worker_name,
-        ip,
-        tags.as_slice(),
-        *WORKER_GROUP,
-        dw,
-        crate::utils::GIT_VERSION,
-        vcpus,
-        memory
-    )
-    .execute(db)
-    .await
-    .expect("insert worker_ping initial value");
+    match db {
+        ConnectionMode::Sql(pool) => {
+            sqlx::query!(
+                "INSERT INTO worker_ping (worker_instance, worker, ip, custom_tags, worker_group, dedicated_worker, wm_version, vcpus, memory) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (worker) DO UPDATE set ip = $3, custom_tags = $4, worker_group = $5",
+                worker_instance,
+                worker_name,
+                ip,
+                tags.as_slice(),
+                *WORKER_GROUP,
+                dw,
+                crate::utils::GIT_VERSION,
+                vcpus,
+                memory
+                )
+                .execute(pool)
+                .await
+                .expect("insert worker_ping initial value");
+        }
+        ConnectionMode::Http => {
+            tracing::error!("Cannot update ping in http mode");
+        }
+    }
 }
 
 pub async fn load_worker_config(

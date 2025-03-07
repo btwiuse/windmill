@@ -132,7 +132,7 @@ async fn install_galaxy_collections(
         job_id,
         w_id,
         "\n\n--- ANSIBLE GALAXY INSTALL ---\n".to_string(),
-        db,
+        db.clone(),
     )
     .await;
     let mut galaxy_command = Command::new(ANSIBLE_GALAXY_PATH.as_str());
@@ -198,7 +198,7 @@ pub async fn handle_ansible_job(
     )?;
 
     let (logs, reqs, playbook) = windmill_parser_yaml::parse_ansible_reqs(inner_content)?;
-    append_logs(&job.id, &job.workspace_id, logs, db).await;
+    append_logs(&job.id, &job.workspace_id, logs, db.clone()).await;
     write_file(job_dir, "main.yml", &playbook)?;
 
     let additional_python_paths = handle_ansible_python_deps(
@@ -295,7 +295,7 @@ pub async fn handle_ansible_job(
         &job.id,
         &job.workspace_id,
         "\n\n--- ANSIBLE PLAYBOOK EXECUTION ---\n".to_string(),
-        db,
+        db.clone(),
     )
     .await;
     let ansible_cfg_content = format!(
@@ -560,7 +560,7 @@ async fn create_file_resources(
             file_res.target_path, file_res.resource_path
         ));
     }
-    append_logs(job_id, w_id, logs, db).await;
+    append_logs(job_id, w_id, logs, db.clone()).await;
 
     Ok(nsjail_mounts)
 }

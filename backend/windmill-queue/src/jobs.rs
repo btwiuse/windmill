@@ -27,6 +27,7 @@ use windmill_audit::audit_ee::{audit_log, AuditAuthor};
 use windmill_audit::ActionKind;
 
 use windmill_common::utils::now_from_db;
+use windmill_common::worker::ConnectionMode;
 use windmill_common::{
     auth::{fetch_authed_from_permissioned_as, permissioned_as_to_username},
     cache::{self, FlowData},
@@ -150,7 +151,7 @@ pub async fn cancel_single_job<'c>(
                 &job_running.id,
                 w_id.to_string(),
                 format!("canceled by {username}: (force cancel: {force_cancel})"),
-                &db,
+                db.clone(),
             )
             .await;
             let add_job = add_completed_job_error(
@@ -247,7 +248,7 @@ pub async fn cancel_job<'c>(
     while !jobs.is_empty() {
         let p_job = jobs.pop();
         let new_jobs = sqlx::query_scalar!(
-            "SELECT id AS \"id!\" FROM v2_job WHERE parent_job = $1 AND workspace_id = $2",
+            "SELECT id AS \"id!\" FROM v2_job_queue INNER JOIN v2_job USING (id) WHERE parent_job = $1 AND v2_job.workspace_id = $2",
             p_job,
             w_id
         )
@@ -297,7 +298,7 @@ pub async fn append_logs(
     job_id: &uuid::Uuid,
     workspace: impl AsRef<str>,
     logs: impl AsRef<str>,
-    db: impl Borrow<Pool<Postgres>>,
+    db: impl Borrow<ConnectionMode>,
 ) {
     if logs.as_ref().is_empty() {
         return;
@@ -312,17 +313,24 @@ pub async fn append_logs(
         tracing::info!("NO LOGS [{job_id}]: {}", logs.as_ref());
         return;
     }
-    if let Err(err) = sqlx::query!(
-        "INSERT INTO job_logs (logs, job_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT (job_id) DO UPDATE SET logs = concat(job_logs.logs, $1::text)",
-        logs.as_ref(),
-        job_id,
-        workspace.as_ref(),
-    )
-    .execute(db.borrow())
-    .warn_after_seconds(1)
-    .await
-    {
-        tracing::error!(%job_id, %err, "error updating logs for large_log job {job_id}: {err}");
+    match db.borrow() {
+        ConnectionMode::Sql(pool) => {
+            if let Err(err) = sqlx::query!(
+                "INSERT INTO job_logs (logs, job_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT (job_id) DO UPDATE SET logs = concat(job_logs.logs, $1::text)",
+                logs.as_ref(),
+                job_id,
+                workspace.as_ref(),
+            )
+            .execute(pool)
+            .warn_after_seconds(1)
+            .await
+            {
+                tracing::error!(%job_id, %err, "error updating logs for large_log job {job_id}: {err}");
+            }
+        }
+        ConnectionMode::Http => {
+            tracing::error!("Cannot append logs to job {job_id} in http mode");
+        }
     }
 }
 
@@ -2048,7 +2056,13 @@ pub async fn pull(
         let job_log_event = format!(
             "\nRe-scheduled job to {estimated_next_schedule_timestamp} due to concurrency limits with key {job_concurrency_key} and limit {job_custom_concurrent_limit} in the last {job_custom_concurrency_time_window_s} seconds",
         );
-        let _ = append_logs(&job_uuid, &pulled_job.workspace_id, job_log_event, db).await;
+        let _ = append_logs(
+            &job_uuid,
+            &pulled_job.workspace_id,
+            job_log_event,
+            db.clone(),
+        )
+        .await;
 
         // if using posgtres, then we're able to re-queue the entire batch of scheduled job for this script_path, so we do it
         sqlx::query!(

@@ -81,7 +81,7 @@ pub async fn handle_bash_job(
     if annotation.docker {
         logs1.push_str("docker mode\n");
     }
-    append_logs(&job.id, &job.workspace_id, logs1, db).await;
+    append_logs(&job.id, &job.workspace_id, logs1, db.clone()).await;
 
     write_file(job_dir, "main.sh", &format!("set -e\n{content}"))?;
     let script = format!(
