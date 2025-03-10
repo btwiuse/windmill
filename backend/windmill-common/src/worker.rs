@@ -117,55 +117,6 @@ pub enum ConnectionMode {
     Http,
 }
 
-impl ConnectionMode {
-    pub async fn push_job(&self, job: &Job) {
-        match self {
-            ConnectionMode::Sql(pool) => {
-                let tx = PushIsolationLevel::IsolatedRoot(db.clone());
-                let ehm = HashMap::new();
-                let (uuid, inner_tx) = push(
-                    &db,
-                    tx,
-                    "admins",
-                    windmill_common::jobs::JobPayload::Code(windmill_common::jobs::RawCode {
-                        hash: None,
-                        content: content.clone(),
-                        path: Some(format!("init_script_{worker_name}")),
-                        language: ScriptLang::Bash,
-                        lock: None,
-                        custom_concurrency_key: None,
-                        concurrent_limit: None,
-                        concurrency_time_window_s: None,
-                        cache_ttl: None,
-                        dedicated_worker: None,
-                    }),
-                    PushArgs::from(&ehm),
-                    worker_name,
-                    "worker@windmill.dev",
-                    SUPERADMIN_SECRET_EMAIL.to_string(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                    true,
-                    None,
-                    true,
-                    Some("init_script".to_string()),
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await?;
-                inner_tx.commit().await?;
-            }
-            ConnectionMode::Http => tracing::error!("Cannot push job in http mode"),
-        }
-    }
-}
-
 impl From<Pool<Postgres>> for ConnectionMode {
     fn from(value: Pool<Postgres>) -> Self {
         ConnectionMode::Sql(value)

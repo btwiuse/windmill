@@ -2452,6 +2452,67 @@ pub async fn get_result_by_id_from_running_flow_inner(
     Ok(result_id)
 }
 
+async fn push_job<'d>(
+    conn: &ConnectionMode,
+    workspace_id: &str,
+    job_payload: JobPayload,
+    mut args: PushArgs<'d>,
+    user: &str,
+    mut email: &str,
+    mut permissioned_as: String,
+    scheduled_for_o: Option<chrono::DateTime<chrono::Utc>>,
+    schedule_path: Option<String>,
+    parent_job: Option<Uuid>,
+    root_job: Option<Uuid>,
+    job_id: Option<Uuid>,
+    _is_flow_step: bool,
+    mut same_worker: bool,
+    pre_run_error: Option<&windmill_common::error::Error>,
+    visible_to_owner: bool,
+    mut tag: Option<String>,
+    custom_timeout: Option<i32>,
+    flow_step_id: Option<String>,
+    _priority_override: Option<i16>,
+    authed: Option<&Authed>,
+) -> error::Result<Uuid> {
+    match conn {
+        ConnectionMode::Sql(db) => {
+            let mut tx = db.begin().await?;
+
+            let (id, tx) = push(
+                db,
+                &mut tx,
+                workspace_id,
+                job_payload,
+                args,
+                user,
+                email,
+                permissioned_as,
+                scheduled_for_o,
+                schedule_path,
+                parent_job,
+                root_job,
+                job_id,
+                _is_flow_step,
+                same_worker,
+                pre_run_error,
+                visible_to_owner,
+                tag,
+                custom_timeout,
+                flow_step_id,
+                _priority_override,
+                authed,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(id)
+        }
+        ConnectionMode::Http => {
+            todo!()
+        }
+    }
+}
+
 async fn get_completed_flow_node_result_rec(
     db: &Pool<Postgres>,
     w_id: &str,
