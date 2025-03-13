@@ -22,6 +22,7 @@ use error::Error;
 use scripts::ScriptLang;
 use sqlx::{Pool, Postgres};
 
+pub mod agent_workers;
 pub mod apps;
 pub mod auth;
 pub mod cache;

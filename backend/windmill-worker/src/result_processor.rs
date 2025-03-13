@@ -21,13 +21,8 @@ use windmill_common::{
     error::{self, Error},
     jobs::{JobKind, QueuedJob},
     utils::WarnAfterExt,
-<<<<<<< HEAD
     worker::{to_raw_value, ConnectionMode, WORKER_GROUP},
     DB,
-=======
-    worker::{to_raw_value, WORKER_GROUP},
-    KillpillSender, DB,
->>>>>>> main
 };
 
 #[cfg(feature = "benchmark")]

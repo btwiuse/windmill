@@ -5,6 +5,7 @@ mod mssql_executor;
 #[cfg(feature = "enterprise")]
 mod snowflake_executor;
 
+mod agent_workers;
 #[cfg(feature = "python")]
 mod ansible_executor;
 mod bash_executor;

@@ -10,6 +10,7 @@
 // use opentelemetry::{global,  KeyValue};
 
 use windmill_common::{
+    agent_workers::QueueInitJob,
     apps::AppScriptId,
     auth::{fetch_authed_from_permissioned_as, JWTAuthClaims, JobPerms},
     cache::{ScriptData, ScriptMetadata},
@@ -20,7 +21,7 @@ use windmill_common::{
         get_memory, get_vcpus, get_windmill_memory_usage, get_worker_memory_usage, write_file,
         ConnectionMode, ROOT_CACHE_DIR, ROOT_CACHE_NOMOUNT_DIR, TMP_DIR,
     },
-    KillpillSender,
+    KillpillSender, BASE_URL,
 };
 
 #[cfg(feature = "enterprise")]
@@ -65,8 +66,8 @@ use windmill_common::{
 };
 
 use windmill_queue::{
-    append_logs, canceled_job_to_result, empty_result, pull, push, CanceledBy, PulledJob, PushArgs,
-    PushIsolationLevel, HTTP_CLIENT,
+    append_logs, canceled_job_to_result, empty_result, pull, push, push_init_job, CanceledBy,
+    PulledJob, PushArgs, PushIsolationLevel, HTTP_CLIENT,
 };
 
 #[cfg(feature = "prometheus")]
@@ -1806,47 +1807,14 @@ async fn queue_init_bash_maybe<'c>(
     db: &ConnectionMode,
     same_worker_tx: SameWorkerSender,
     worker_name: &str,
-) -> error::Result<bool> {
+) -> anyhow::Result<bool> {
     if let Some(content) = WORKER_CONFIG.read().await.init_bash.clone() {
-        let tx = PushIsolationLevel::IsolatedRoot(db.clone());
-        let ehm = HashMap::new();
-        let (uuid, inner_tx) = push(
-            &db,
-            tx,
-            "admins",
-            windmill_common::jobs::JobPayload::Code(windmill_common::jobs::RawCode {
-                hash: None,
-                content: content.clone(),
-                path: Some(format!("init_script_{worker_name}")),
-                language: ScriptLang::Bash,
-                lock: None,
-                custom_concurrency_key: None,
-                concurrent_limit: None,
-                concurrency_time_window_s: None,
-                cache_ttl: None,
-                dedicated_worker: None,
-            }),
-            PushArgs::from(&ehm),
-            worker_name,
-            "worker@windmill.dev",
-            SUPERADMIN_SECRET_EMAIL.to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            true,
-            None,
-            true,
-            Some("init_script".to_string()),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await?;
-        inner_tx.commit().await?;
+        let uuid = match db {
+            ConnectionMode::Sql(db) => push_init_job(db, content.clone(), worker_name).await?,
+            ConnectionMode::Http => {
+                crate::agent_workers::queue_init_job(worker_name, &content).await?
+            }
+        };
         same_worker_tx
             .send(SameWorkerPayload { job_id: uuid, recoverable: false })
             .await

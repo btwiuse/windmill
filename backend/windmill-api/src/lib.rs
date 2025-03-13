@@ -56,6 +56,7 @@ use windmill_common::{utils::GIT_VERSION, BASE_URL, INSTANCE_NAME};
 use crate::scim_ee::has_scim_token;
 use windmill_common::error::AppError;
 
+mod agent_workers;
 mod ai;
 mod apps;
 mod args;
@@ -476,6 +477,7 @@ pub async fn run_server(
                     "/users",
                     users::global_service().layer(Extension(argon2.clone())),
                 )
+                .nest("/agent_workers", agent_workers::global_service())
                 .nest("/settings", settings::global_service())
                 .nest("/workers", workers::global_service())
                 .nest("/service_logs", service_logs::global_service())
