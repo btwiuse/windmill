@@ -1,7 +1,7 @@
 openapi: "3.0.3"
 
 info:
-  version: 1.475.0
+  version: 1.477.0
   title: Windmill API
 
   contact:
@@ -8116,6 +8116,8 @@ paths:
                   enum: ["get", "post", "put", "delete", "patch"]
                 trigger_path:
                   type: string
+                workspaced_route:
+                  type: boolean
               required:
                 - route_path
                 - http_method
@@ -10033,6 +10035,23 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Folder"
+  
+  /w/{workspace}/folders/exists/{name}:
+    get:
+      summary: exists folder
+      operationId: existsFolder
+      tags:
+        - folder
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - $ref: "#/components/parameters/Name"
+      responses:
+        "200":
+          description: folder exists
+          content:
+            application/json:
+              schema:
+                type: boolean
 
   /w/{workspace}/folders/getusage/{name}:
     get:
@@ -10678,6 +10697,7 @@ paths:
         - $ref: "#/components/parameters/RunnableTypeQuery"
         - $ref: "#/components/parameters/Page"
         - $ref: "#/components/parameters/PerPage"
+        - $ref: "#/components/parameters/ArgsFilter"
         - name: include_preview
           in: query
           schema:
@@ -13750,6 +13770,8 @@ components:
           type: boolean
         is_static_website:
           type: boolean
+        workspaced_route:
+          type: boolean
 
       required:
         - route_path
@@ -13767,6 +13789,8 @@ components:
           type: string
         route_path:
           type: string
+        workspaced_route:
+          type: boolean
         static_asset_config:
           type: object
           properties:
@@ -13814,6 +13838,8 @@ components:
           type: string
         route_path:
           type: string
+        workspaced_route:
+          type: boolean
         static_asset_config:
           type: object
           properties:
