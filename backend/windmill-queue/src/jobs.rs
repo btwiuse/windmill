@@ -27,7 +27,7 @@ use windmill_audit::audit_ee::{audit_log, AuditAuthor};
 use windmill_audit::ActionKind;
 
 use windmill_common::utils::now_from_db;
-use windmill_common::worker::ConnectionMode;
+use windmill_common::worker::Connection;
 use windmill_common::{
     auth::{fetch_authed_from_permissioned_as, permissioned_as_to_username},
     cache::{self, FlowData},
@@ -298,7 +298,7 @@ pub async fn append_logs(
     job_id: &uuid::Uuid,
     workspace: impl AsRef<str>,
     logs: impl AsRef<str>,
-    db: impl Borrow<ConnectionMode>,
+    db: impl Borrow<Connection>,
 ) {
     if logs.as_ref().is_empty() {
         return;
@@ -314,7 +314,7 @@ pub async fn append_logs(
         return;
     }
     match db.borrow() {
-        ConnectionMode::Sql(pool) => {
+        Connection::Sql(pool) => {
             if let Err(err) = sqlx::query!(
                 "INSERT INTO job_logs (logs, job_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT (job_id) DO UPDATE SET logs = concat(job_logs.logs, $1::text)",
                 logs.as_ref(),
@@ -328,7 +328,7 @@ pub async fn append_logs(
                 tracing::error!(%job_id, %err, "error updating logs for large_log job {job_id}: {err}");
             }
         }
-        ConnectionMode::Http => {
+        Connection::Http => {
             tracing::error!("Cannot append logs to job {job_id} in http mode");
         }
     }
@@ -4048,7 +4048,7 @@ async fn restarted_flows_resolution(
     })?;
 
     let flow_data = cache::job::fetch_flow(db, row.job_kind, row.script_hash)
-        .or_else(|_| cache::job::fetch_preview_flow(db, &completed_flow_id, row.raw_flow))
+        .or_else(|_| cache::job::fetch_preview_flow(db.into(), &completed_flow_id, row.raw_flow))
         .await?;
     let flow_value = flow_data.value();
     let flow_status = row

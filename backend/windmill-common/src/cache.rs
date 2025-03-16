@@ -608,7 +608,7 @@ pub mod app {
 
 pub mod job {
     use super::*;
-    use crate::jobs::JobKind;
+    use crate::{jobs::JobKind, worker::Connection};
 
     #[cfg(not(feature = "scoped_cache"))]
     lazy_static! {
@@ -628,14 +628,14 @@ pub mod job {
     }
 
     #[track_caller]
-    pub fn fetch_preview_flow<'a, 'c>(
-        e: impl PgExecutor<'c> + 'a,
+    pub fn fetch_preview_flow<'a>(
+        conn: &'a Connection,
         job: &'a Uuid,
         // original raw values from `queue` or `completed_job` tables:
         // kept for backward compatibility.
         raw_flow: Option<Json<Box<RawValue>>>,
     ) -> impl Future<Output = error::Result<Arc<FlowData>>> + 'a {
-        let fetch_preview = fetch_preview(e, job, None, None, raw_flow);
+        let fetch_preview = fetch_preview(conn, job, None, None, raw_flow);
         async move {
             fetch_preview.await.and_then(|data| match data {
                 RawData::Flow(data) => Ok(data),
@@ -648,7 +648,7 @@ pub mod job {
 
     #[track_caller]
     pub fn fetch_preview_script<'a, 'c>(
-        e: impl PgExecutor<'c> + 'a,
+        e: &'a Connection,
         job: &'a Uuid,
         // original raw values from `queue` or `completed_job` tables:
         // kept for backward compatibility.
@@ -668,7 +668,7 @@ pub mod job {
 
     #[track_caller]
     pub fn fetch_preview<'a, 'c>(
-        e: impl PgExecutor<'c> + 'a,
+        e: &'a Connection,
         job: &'a Uuid,
         // original raw values from `queue` or `completed_job` tables:
         // kept for backward compatibility.
@@ -679,16 +679,21 @@ pub mod job {
         let loc = Location::caller();
         let fetch = async move {
             match (raw_lock, raw_code, raw_flow) {
-                (None, None, None) => sqlx::query!(
-                    "SELECT raw_code, raw_lock, raw_flow AS \"raw_flow: Json<Box<RawValue>>\" \
-                    FROM v2_job WHERE id = $1 LIMIT 1",
-                    job
-                )
-                .fetch_optional(e)
-                .await
-                .map_err(Into::into)
-                .and_then(unwrap_or_error(&loc, "Preview", job))
-                .map(|r| (r.raw_lock, r.raw_code, r.raw_flow)),
+                (None, None, None) => match e {
+                    Connection::Sql(pool) => sqlx::query!(
+                        "SELECT raw_code, raw_lock, raw_flow AS \"raw_flow: Json<Box<RawValue>>\" \
+                        FROM v2_job WHERE id = $1 LIMIT 1",
+                        job
+                    )
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(Into::into)
+                    .and_then(unwrap_or_error(&loc, "Preview", job))
+                    .map(|r| (r.raw_lock, r.raw_code, r.raw_flow)),
+                    Connection::Http => Err(error::Error::InternalErr(format!(
+                        "Cannot fetch preview in HTTP mode"
+                    ))),
+                },
                 (lock, code, flow) => Ok((lock, code, flow)),
             }
             .and_then(|(lock, code, flow)| match flow {

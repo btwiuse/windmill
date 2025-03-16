@@ -26,7 +26,7 @@ use tower::ServiceBuilder;
 use windmill_common::error::JsonResult;
 use windmill_common::flow_status::{JobResult, RestartedFrom};
 use windmill_common::jobs::{format_completed_job_result, format_result, ENTRYPOINT_OVERRIDE};
-use windmill_common::worker::{CLOUD_HOSTED, TMP_DIR};
+use windmill_common::worker::{Connection, CLOUD_HOSTED, TMP_DIR};
 
 use windmill_common::scripts::PREVIEW_IS_CODEBASE_HASH;
 use windmill_common::variables::get_workspace_key;
@@ -587,7 +587,7 @@ async fn get_flow_job_debug_info(
     Extension(db): Extension<DB>,
     Path((w_id, id)): Path<(String, Uuid)>,
 ) -> error::Result<Response> {
-    let job = GetQuery::new().fetch_queued(&db, id, &w_id).await?;
+    let job = GetQuery::new().fetch_queued(db.into(), id, &w_id).await?;
     if let Some(job) = job {
         let is_flow = job.is_flow();
         if job.is_flow_step || !is_flow {
@@ -798,7 +798,7 @@ impl<'a> GetQuery<'a> {
     /// will have the raw values as if they were still in the tables.
     async fn resolve_raw_values<T>(
         &self,
-        db: &DB,
+        db: &Connection,
         id: Uuid,
         kind: JobKind,
         hash: Option<ScriptHash>,
@@ -814,7 +814,7 @@ impl<'a> GetQuery<'a> {
             // NOTE: This could check for the job kinds instead of the `or_else` but it's not
             // necessary as `fetch_flow` return early if the job kind is not a preview one.
             cache::job::fetch_flow(db, kind, hash)
-                .or_else(|_| cache::job::fetch_preview_flow(db, &id, raw_flow))
+                .or_else(|_| cache::job::fetch_preview_flow(db.into(), &id, raw_flow))
                 .await
                 .ok()
                 .inspect(|data| job.raw_flow = Some(sqlx::types::Json(data.raw_flow.clone())));
@@ -824,7 +824,7 @@ impl<'a> GetQuery<'a> {
             // NOTE: This could check for the job kinds instead of the `or_else` but it's not
             // necessary as `fetch_script` return early if the job kind is not a preview one.
             cache::job::fetch_script(db, kind, hash)
-                .or_else(|_| cache::job::fetch_preview_script(db, &id, raw_lock, raw_code))
+                .or_else(|_| cache::job::fetch_preview_script(db.into(), &id, raw_lock, raw_code))
                 .await
                 .ok()
                 .inspect(|data| {
@@ -835,7 +835,7 @@ impl<'a> GetQuery<'a> {
 
     async fn fetch_queued(
         self,
-        db: &DB,
+        db: &Connection,
         job_id: Uuid,
         workspace_id: &str,
     ) -> error::Result<Option<JobExtended<QueuedJob>>> {
@@ -849,15 +849,15 @@ impl<'a> GetQuery<'a> {
             .bind(workspace_id)
             .bind(self.with_in_tags);
 
-        let mut job = query.fetch_optional(db).await?;
+        let mut job = query.fetch_optional(db.into()).await?;
 
         self.check_auth(job.as_ref().map(|job| job.created_by.as_str()))?;
         if let Some(job) = job.as_mut() {
-            self.resolve_raw_values(db, job.id, job.job_kind, job.script_hash, job)
+            self.resolve_raw_values(db.into(), job.id, job.job_kind, job.script_hash, job)
                 .await;
         }
         if self.with_flow {
-            job = resolve_maybe_value(db, workspace_id, self.with_code, job, |job| {
+            job = resolve_maybe_value(db.into(), workspace_id, self.with_code, job, |job| {
                 job.raw_flow.as_mut()
             })
             .await?;
@@ -867,7 +867,7 @@ impl<'a> GetQuery<'a> {
 
     async fn fetch_completed(
         self,
-        db: &DB,
+        db: &Connection,
         job_id: Uuid,
         workspace_id: &str,
     ) -> error::Result<Option<JobExtended<CompletedJob>>> {
@@ -881,15 +881,15 @@ impl<'a> GetQuery<'a> {
             .bind(workspace_id)
             .bind(self.with_in_tags);
 
-        let mut cjob = query.fetch_optional(db).await?;
+        let mut cjob = query.fetch_optional(db.into()).await?;
 
         self.check_auth(cjob.as_ref().map(|job| job.created_by.as_str()))?;
         if let Some(job) = cjob.as_mut() {
-            self.resolve_raw_values(db, job.id, job.job_kind, job.script_hash, job)
+            self.resolve_raw_values(db.into(), job.id, job.job_kind, job.script_hash, job)
                 .await;
         }
         if self.with_flow {
-            cjob = resolve_maybe_value(db, workspace_id, self.with_code, cjob, |job| {
+            cjob = resolve_maybe_value(db.into(), workspace_id, self.with_code, cjob, |job| {
                 job.raw_flow.as_mut()
             })
             .await?;
@@ -903,7 +903,7 @@ impl<'a> GetQuery<'a> {
 
     async fn fetch(self, db: &DB, job_id: Uuid, workspace_id: &str) -> error::Result<Job> {
         let cjob = self
-            .fetch_completed(db, job_id, workspace_id)
+            .fetch_completed(db.into(), job_id, workspace_id)
             .await?
             .map(Job::CompletedJob);
 
@@ -911,7 +911,7 @@ impl<'a> GetQuery<'a> {
             Some(cjob) => Ok(cjob),
             None => {
                 let job_maybe = self
-                    .fetch_queued(db, job_id, workspace_id)
+                    .fetch_queued(db.into(), job_id, workspace_id)
                     .await?
                     .map(Job::QueuedJob);
                 // potential race condition here, if the job was in queue and completed right after the fetch completed, so we need to check one last time
@@ -919,7 +919,7 @@ impl<'a> GetQuery<'a> {
                     return Ok(job);
                 } else {
                     let cjob2 = self
-                        .fetch_completed(db, job_id, workspace_id)
+                        .fetch_completed(db.into(), job_id, workspace_id)
                         .await?
                         .map(Job::CompletedJob);
                     not_found_if_none(cjob2, "Job", job_id.to_string())
@@ -3340,7 +3340,7 @@ pub async fn run_workflow_as_code(
 
     let job = GetQuery::new()
         .without_logs()
-        .fetch_queued(&db, job_id, &w_id)
+        .fetch_queued(&Connection::Sql(db), job_id, &w_id)
         .await?;
 
     if *CLOUD_HOSTED {

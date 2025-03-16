@@ -37,17 +37,20 @@ pub fn global_service() -> Router {
 }
 
 async fn queue_init_job(
-    AgentClaims { worker_name, .. }: AgentClaims,
+    AgentClaims { worker_name_prefix, .. }: AgentClaims,
     Extension(db): Extension<DB>,
-    Json(queue_init_job): Json<QueueInitJob>,
+    Json(QueueInitJob { content, worker_name }): Json<QueueInitJob>,
 ) -> Result<StatusCode> {
-    push_init_job(&db, queue_init_job.content, &worker_name).await?;
+    if !worker_name.starts_with(&worker_name_prefix) {
+        return Err(anyhow::anyhow!("Worker name must start with {}", worker_name_prefix).into());
+    }
+    push_init_job(&db, content, &worker_name).await?;
     Ok(StatusCode::OK)
 }
 
 #[derive(Serialize, Deserialize)]
 struct AgentClaims {
-    worker_name: String,
+    worker_name_prefix: String,
     tags: Vec<String>,
 }
 
@@ -63,7 +66,7 @@ where
         _state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
         if parts.method == http::Method::OPTIONS {
-            return Ok(AgentClaims { worker_name: "".to_string(), tags: Vec::new() });
+            return Ok(AgentClaims { worker_name_prefix: "".to_string(), tags: Vec::new() });
         };
 
         let auth_header = parts

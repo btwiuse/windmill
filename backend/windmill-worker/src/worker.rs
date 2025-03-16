@@ -19,7 +19,7 @@ use windmill_common::{
     utils::WarnAfterExt,
     worker::{
         get_memory, get_vcpus, get_windmill_memory_usage, get_worker_memory_usage, write_file,
-        ConnectionMode, ROOT_CACHE_DIR, ROOT_CACHE_NOMOUNT_DIR, TMP_DIR,
+        Connection, ROOT_CACHE_DIR, ROOT_CACHE_NOMOUNT_DIR, TMP_DIR,
     },
     KillpillSender, BASE_URL,
 };
@@ -113,6 +113,7 @@ use crate::{
     worker_lockfiles::{
         handle_app_dependency_job, handle_dependency_job, handle_flow_dependency_job,
     },
+    worker_utils::{pull_same_worker_job, queue_vacuum, update_worker_ping_full},
 };
 
 #[cfg(feature = "rust")]
@@ -154,14 +155,14 @@ use crate::bench::{benchmark_init, BenchmarkInfo, BenchmarkIter};
 use windmill_common::add_time;
 
 pub async fn create_token_for_owner_in_bg(
-    db: &Pool<Postgres>,
+    conn: &Connection,
     job: &QueuedJob,
 ) -> Arc<RwLock<String>> {
     let rw_lock = Arc::new(RwLock::new(String::new()));
     // skipping test runs
     if job.workspace_id != "" {
         let mut locked = rw_lock.clone().write_owned().await;
-        let db = db.clone();
+        let conn = conn.clone();
         let w_id = job.workspace_id.clone();
         let owner = job.permissioned_as.clone();
         let email = job.email.clone();
@@ -175,19 +176,24 @@ pub async fn create_token_for_owner_in_bg(
             "ephemeral-script".to_string()
         };
         tokio::spawn(async move {
-            let token = create_token_for_owner(
-                &db.clone(),
-                &w_id,
-                &owner,
-                &label,
-                *SCRIPT_TOKEN_EXPIRY,
-                &email,
-                &job_id,
-            )
-            .warn_after_seconds(5)
-            .await
-            .expect("could not create job token");
-            *locked = token;
+            match conn {
+                Connection::Sql(db) => {
+                    let token = create_token_for_owner(
+                        &db.clone(),
+                        &w_id,
+                        &owner,
+                        &label,
+                        *SCRIPT_TOKEN_EXPIRY,
+                        &email,
+                        &job_id,
+                    )
+                    .warn_after_seconds(5)
+                    .await
+                    .expect("could not create job token");
+                    *locked = token;
+                }
+                Connection::Http => todo!(),
+            }
         });
     };
     return rw_lock;
@@ -638,6 +644,10 @@ impl JobCompletedSender {
     ) -> Result<(), tokio::sync::mpsc::error::SendError<SendResult>> {
         self.0.send(SendResult::JobCompleted(jc)).await
     }
+
+    pub async fn kill(&self) -> Result<(), tokio::sync::mpsc::error::SendError<SendResult>> {
+        self.0.send(SendResult::Kill).await
+    }
 }
 
 impl SameWorkerSender {
@@ -679,37 +689,42 @@ const OUTSTANDING_WAIT_TIME_THRESHOLD_MS: i64 = 1000;
 async fn insert_wait_time(
     job_id: Uuid,
     root_job_id: Option<Uuid>,
-    db: &Pool<Postgres>,
+    conn: &Connection,
     wait_time: i64,
 ) -> sqlx::error::Result<()> {
-    sqlx::query!(
-        "INSERT INTO outstanding_wait_time(job_id, self_wait_time_ms) VALUES ($1, $2)
-            ON CONFLICT (job_id) DO UPDATE SET self_wait_time_ms = EXCLUDED.self_wait_time_ms",
-        job_id,
-        wait_time
-    )
-    .execute(db)
-    .await?;
+    match conn {
+        Connection::Sql(db) => {
+            sqlx::query!(
+                "INSERT INTO outstanding_wait_time(job_id, self_wait_time_ms) VALUES ($1, $2)
+                    ON CONFLICT (job_id) DO UPDATE SET self_wait_time_ms = EXCLUDED.self_wait_time_ms",
+                job_id,
+                wait_time
+            )
+            .execute(db)
+            .await?;
 
-    if let Some(root_id) = root_job_id {
-        // TODO: queued_job.root_job is not guaranteed to be the true root job (e.g. parallel flow
-        // subflows). So this is currently incorrect for those cases
-        sqlx::query!(
+            if let Some(root_id) = root_job_id {
+                // TODO: queued_job.root_job is not guaranteed to be the true root job (e.g. parallel flow
+                // subflows). So this is currently incorrect for those cases
+                sqlx::query!(
             "INSERT INTO outstanding_wait_time(job_id, aggregate_wait_time_ms) VALUES ($1, $2)
                 ON CONFLICT (job_id) DO UPDATE SET aggregate_wait_time_ms =
                 COALESCE(outstanding_wait_time.aggregate_wait_time_ms, 0) + EXCLUDED.aggregate_wait_time_ms",
             root_id,
             wait_time
-        )
-        .execute(db)
-        .await?;
+                )
+                .execute(db)
+                .await?;
+            }
+        }
+        Connection::Http => todo!(),
     }
     Ok(())
 }
 
 fn add_outstanding_wait_time(
     queued_job: &QueuedJob,
-    db: &Pool<Postgres>,
+    conn: &Connection,
     waiting_threshold: i64,
 ) -> () {
     let wait_time;
@@ -726,22 +741,18 @@ fn add_outstanding_wait_time(
 
     let job_id = queued_job.id;
     let root_job_id = queued_job.root_job;
-    let db = db.clone();
+    let conn = conn.clone();
 
     tokio::spawn(async move {
-            match insert_wait_time(job_id, root_job_id, &db, wait_time).await {
+            match insert_wait_time(job_id, root_job_id, &conn, wait_time).await {
                 Ok(()) => tracing::warn!("job {job_id} waited for an executor for a significant amount of time. Recording value wait_time={}ms", wait_time),
                 Err(e) => tracing::error!("Failed to insert outstanding wait time: {}", e),
             }
     }.in_current_span());
 }
 
-// struct WorkerMtrics {
-//     job_
-// }
-
 pub async fn run_worker(
-    db: &ConnectionMode,
+    conn: &Connection,
     hostname: &str,
     worker_name: String,
     i_worker: u64,
@@ -768,15 +779,15 @@ pub async fn run_worker(
     #[cfg(feature = "python")]
     {
         let (db, worker_name, hostname, worker_dir) = (
-            db.clone(),
+            conn.clone(),
             worker_name.clone(),
             hostname.to_owned(),
             worker_dir.clone(),
         );
         tokio::spawn(async move {
-            if let Err(e) = PyVersion::from_instance_version(&Uuid::nil(), "", &db)
+            if let Err(e) = PyVersion::from_instance_version(&Uuid::nil(), "", &conn)
                 .await
-                .get_python(&Uuid::nil(), &mut 0, &db, &worker_name, "", &mut None)
+                .get_python(&Uuid::nil(), &mut 0, &conn, &worker_name, "", &mut None)
                 .await
             {
                 tracing::error!(
@@ -787,7 +798,7 @@ pub async fn run_worker(
                 );
             }
             if let Err(e) = PyVersion::Py311
-                .get_python(&Uuid::nil(), &mut 0, &db, &worker_name, "", &mut None)
+                .get_python(&Uuid::nil(), &mut 0, &conn, &worker_name, "", &mut None)
                 .await
             {
                 tracing::error!(
@@ -820,7 +831,7 @@ pub async fn run_worker(
 
     let mut last_ping = Instant::now() - Duration::from_secs(NUM_SECS_PING + 1);
 
-    update_ping(hostname, &worker_name, ip, db).await;
+    update_ping(hostname, &worker_name, ip, conn).await;
 
     #[cfg(feature = "prometheus")]
     let uptime_metric = if METRICS_ENABLED.load(Ordering::Relaxed) {
@@ -1029,7 +1040,7 @@ pub async fn run_worker(
         .unwrap();
 
     #[cfg(feature = "benchmark")]
-    benchmark_init(benchmark_jobs, &db).await;
+    benchmark_init(benchmark_jobs, &conn).await;
 
     #[cfg(feature = "prometheus")]
     if let Some(ws) = WORKER_STARTED.as_ref() {
@@ -1052,7 +1063,7 @@ pub async fn run_worker(
         same_worker_queue_size.clone(),
         job_completed_processor_is_done.clone(),
         base_internal_url.to_string(),
-        db.clone(),
+        conn.clone(),
         worker_dir.clone(),
         same_worker_tx.clone(),
         worker_name.clone(),
@@ -1087,8 +1098,8 @@ pub async fn run_worker(
         HashMap<String, Sender<Arc<QueuedJob>>>,
         bool,
         Vec<JoinHandle<()>>,
-    ) = match db {
-        ConnectionMode::Sql(pool) => {
+    ) = match conn {
+        Connection::Sql(pool) => {
             create_dedicated_worker_map(
                 &killpill_tx,
                 &killpill_rx,
@@ -1100,7 +1111,7 @@ pub async fn run_worker(
             )
             .await
         }
-        ConnectionMode::Http => (HashMap::new(), false, vec![]),
+        Connection::Http => (HashMap::new(), false, vec![]),
     };
 
     #[cfg(not(feature = "enterprise"))]
@@ -1111,7 +1122,7 @@ pub async fn run_worker(
     ) = (HashMap::new(), false, vec![]);
 
     if i_worker == 1 {
-        if let Err(e) = queue_init_bash_maybe(db, same_worker_tx.clone(), &worker_name).await {
+        if let Err(e) = queue_init_bash_maybe(conn, same_worker_tx.clone(), &worker_name).await {
             killpill_tx.send();
             tracing::error!(worker = %worker_name, hostname = %hostname, "Error queuing init bash script for worker {worker_name}: {e:#}");
             return;
@@ -1149,8 +1160,7 @@ pub async fn run_worker(
             if let Ok(_) = killpill_rx.try_recv() {
                 tracing::info!(worker = %worker_name, hostname = %hostname, "killpill received on worker waiting for valid key");
                 job_completed_tx
-                    .0
-                    .send(SendResult::Kill)
+                    .kill()
                     .await
                     .expect("send kill to job completed tx");
                 break;
@@ -1189,85 +1199,27 @@ pub async fn run_worker(
         }
 
         if last_ping.elapsed().as_secs() > NUM_SECS_PING {
-            let tags = WORKER_CONFIG.read().await.worker_tags.clone();
-
-            let memory_usage = get_worker_memory_usage();
-            let wm_memory_usage = get_windmill_memory_usage();
-
-            let (vcpus, memory) = if *REFRESH_CGROUP_READINGS
-                && last_reading.elapsed().as_secs() > NUM_SECS_READINGS
-            {
-                last_reading = Instant::now();
-                (get_vcpus(), get_memory())
-            } else {
-                (None, None)
-            };
-
-            let (occupancy_rate, occupancy_rate_15s, occupancy_rate_5m, occupancy_rate_30m) =
-                occupancy_metrics.update_occupancy_metrics();
-
-            if let Err(e) = (|| sqlx::query!(
-                "UPDATE worker_ping SET ping_at = now(), jobs_executed = $1, custom_tags = $2,
-                 occupancy_rate = $3, memory_usage = $4, wm_memory_usage = $5, vcpus = COALESCE($7, vcpus),
-                 memory = COALESCE($8, memory), occupancy_rate_15s = $9, occupancy_rate_5m = $10, occupancy_rate_30m = $11 WHERE worker = $6",
+            let read_cgroups =
+                *REFRESH_CGROUP_READINGS && last_reading.elapsed().as_secs() > NUM_SECS_READINGS;
+            update_worker_ping_full(
+                &conn,
+                read_cgroups,
                 jobs_executed,
-                tags.as_slice(),
-                occupancy_rate,
-                memory_usage,
-                wm_memory_usage,
                 &worker_name,
-                vcpus,
-                memory,
-                occupancy_rate_15s,
-                occupancy_rate_5m,
-                occupancy_rate_30m
-            ).execute(db)).retry(
-                ConstantBuilder::default()
-                    .with_delay(std::time::Duration::from_secs(2))
-                    .with_max_times(10)
-                    .build(),
+                &hostname,
+                &mut occupancy_metrics,
+                &killpill_tx,
             )
-            .notify(|err, dur| {
-                tracing::error!(
-                    worker = %worker_name, hostname = %hostname,
-                    "retrying updating worker ping in {dur:#?}, err: {err:#?}"
-                );
-            })
-            .sleep(tokio::time::sleep)
-            .await {
-                tracing::error!(
-                    worker = %worker_name, hostname = %hostname,
-                    "failed to update worker ping, exiting: {}", e);
-                killpill_tx.send();
-            }
-            tracing::info!(
-                worker = %worker_name, hostname = %hostname,
-                "ping update, memory: container={}MB, windmill={}MB",
-                memory_usage.unwrap_or_default() / (1024 * 1024),
-                wm_memory_usage.unwrap_or_default() / (1024 * 1024)
-            );
+            .await;
 
+            if read_cgroups {
+                last_reading = Instant::now();
+            }
             last_ping = Instant::now();
         }
 
         if (jobs_executed as u32 + vacuum_shift) % VACUUM_PERIOD == 0 {
-            let db2 = db.clone();
-            let current_span = tracing::Span::current();
-            let worker_name = worker_name.clone();
-            let hostname = hostname.to_string();
-            tokio::task::spawn(
-                (async move {
-                    tracing::info!(worker = %worker_name, hostname = %hostname, "vacuuming queue");
-                    if let Err(e) = sqlx::query!("VACUUM v2_job_queue, v2_job_runtime, v2_job_status")
-                        .execute(&db2)
-                        .await
-                    {
-                        tracing::error!(worker = %worker_name, hostname = %hostname, "failed to vacuum queue: {}", e);
-                    }
-                    tracing::info!(worker = %worker_name, hostname = %hostname, "vacuumed queue");
-                })
-                .instrument(current_span),
-            );
+            queue_vacuum(&conn, &worker_name, &hostname).await;
             jobs_executed += 1;
         }
 
@@ -1281,8 +1233,7 @@ pub async fn run_worker(
         if benchmark_jobs > 0 && infos.iters == benchmark_jobs as u64 {
             tracing::info!("benchmark finished, exiting");
             job_completed_tx
-                .0
-                .send(SendResult::Kill)
+                .kill()
                 .await
                 .expect("send kill to job completed tx");
             break;
@@ -1299,42 +1250,22 @@ pub async fn run_worker(
 
             if let Ok(same_worker_job) = same_worker_rx.try_recv() {
                 same_worker_queue_size.fetch_sub(1, Ordering::SeqCst);
-                tracing::debug!(
-                    worker = %worker_name, hostname = %hostname,
-                    "received {} from same worker channel",
-                    same_worker_job.job_id
-                );
-                let r = sqlx::query_as::<_, PulledJob>(
-                    "
-                    WITH ping AS (
-                        UPDATE v2_job_runtime SET ping = NOW() WHERE id = $1 RETURNING id
-                    )
-                    SELECT * FROM v2_as_queue WHERE id = (SELECT id FROM ping)
-                    ",
+                let r = pull_same_worker_job(
+                    &conn,
+                    &worker_name,
+                    &hostname,
+                    same_worker_job,
+                    &job_completed_tx,
                 )
-                .bind(same_worker_job.job_id)
-                .fetch_optional(db)
-                .await
-                .map_err(|e| {
-                    Error::internal_err(format!(
-                        "Impossible to fetch same_worker job {}: {}",
-                        same_worker_job.job_id, e
-                    ))
-                });
-                let _ = sqlx::query!(
-                    "UPDATE v2_job_queue SET started_at = NOW() WHERE id = $1",
-                    same_worker_job.job_id
-                )
-                .execute(db)
                 .await;
+
                 if r.is_err() && !same_worker_job.recoverable {
                     tracing::error!(
                         worker = %worker_name, hostname = %hostname,
                         "failed to fetch same_worker job on a non recoverable job, exiting"
                     );
                     job_completed_tx
-                        .0
-                        .send(SendResult::Kill)
+                        .kill()
                         .await
                         .expect("send kill to job completed tx");
                     break;
@@ -1346,8 +1277,7 @@ pub async fn run_worker(
                     tracing::info!(worker = %worker_name, hostname = %hostname, "received killpill for worker {}, jobs are not pulled anymore except same_worker jobs", i_worker);
                     killed_but_draining_same_worker_jobs = true;
                     job_completed_tx
-                        .0
-                        .send(SendResult::Kill)
+                        .kill()
                         .await
                         .expect("send kill to job completed tx");
                 }
@@ -1373,7 +1303,10 @@ pub async fn run_worker(
                     last_suspend_first = Instant::now();
                 }
 
-                let job = pull(&db, suspend_first, &worker_name).await;
+                let job = match conn {
+                    Connection::Sql(db) => pull(&db, suspend_first, &worker_name).await,
+                    Connection::Http => todo!(),
+                };
 
                 add_time!(bench, "job pulled from DB");
                 let duration_pull_s = pull_time.elapsed().as_secs_f64();
@@ -1491,8 +1424,8 @@ pub async fn run_worker(
                         .expect("send job completed END");
                     add_time!(bench, "sent job completed");
                 } else {
-                    let token = create_token_for_owner_in_bg(&db, &job).await;
-                    add_outstanding_wait_time(&job, db, OUTSTANDING_WAIT_TIME_THRESHOLD_MS);
+                    let token = create_token_for_owner_in_bg(&conn, &job).await;
+                    add_outstanding_wait_time(&job, conn, OUTSTANDING_WAIT_TIME_THRESHOLD_MS);
 
                     #[cfg(feature = "prometheus")]
                     register_metric(
@@ -1643,7 +1576,7 @@ pub async fn run_worker(
                         raw_code,
                         raw_lock,
                         raw_flow,
-                        db,
+                        conn,
                         &authed_client,
                         &hostname,
                         &worker_name,
@@ -1662,7 +1595,7 @@ pub async fn run_worker(
                     {
                         Err(err) => {
                             handle_job_error(
-                                db,
+                                conn,
                                 &authed_client.get_authed().await,
                                 arc_job.as_ref(),
                                 0,
@@ -1680,7 +1613,7 @@ pub async fn run_worker(
                             if is_init_script {
                                 tracing::error!("init script job failed (in handler), exiting");
                                 update_worker_ping_for_failed_init_script(
-                                    db,
+                                    conn,
                                     &worker_name,
                                     arc_job.id,
                                 )
@@ -1690,8 +1623,12 @@ pub async fn run_worker(
                         }
                         Ok(false) if is_init_script => {
                             tracing::error!("init script job failed, exiting");
-                            update_worker_ping_for_failed_init_script(db, &worker_name, arc_job.id)
-                                .await;
+                            update_worker_ping_for_failed_init_script(
+                                conn,
+                                &worker_name,
+                                arc_job.id,
+                            )
+                            .await;
                             break;
                         }
                         _ => {}
@@ -1804,16 +1741,14 @@ pub async fn run_worker(
 }
 
 async fn queue_init_bash_maybe<'c>(
-    db: &ConnectionMode,
+    db: &Connection,
     same_worker_tx: SameWorkerSender,
     worker_name: &str,
 ) -> anyhow::Result<bool> {
     if let Some(content) = WORKER_CONFIG.read().await.init_bash.clone() {
         let uuid = match db {
-            ConnectionMode::Sql(db) => push_init_job(db, content.clone(), worker_name).await?,
-            ConnectionMode::Http => {
-                crate::agent_workers::queue_init_job(worker_name, &content).await?
-            }
+            Connection::Sql(db) => push_init_job(db, content.clone(), worker_name).await?,
+            Connection::Http => crate::agent_workers::queue_init_job(worker_name, &content).await?,
         };
         same_worker_tx
             .send(SameWorkerPayload { job_id: uuid, recoverable: false })
@@ -1900,7 +1835,7 @@ async fn handle_queued_job(
     raw_code: Option<String>,
     raw_lock: Option<String>,
     raw_flow: Option<Json<Box<RawValue>>>,
-    db: &DB,
+    conn: &Connection,
     client: &AuthedClientBackgroundTask,
     hostname: &str,
     worker_name: &str,
@@ -1926,7 +1861,7 @@ async fn handle_queued_job(
     if job.parent_job.is_none() && job.created_by.starts_with("email-") {
         let daily_count = sqlx::query!(
             "SELECT value FROM metrics WHERE id = 'email_trigger_usage' AND created_at > NOW() - INTERVAL '1 day' ORDER BY created_at DESC LIMIT 1"
-        ).fetch_optional(db)
+        ).fetch_optional(conn)
         .warn_after_seconds(5)
         .await?.map(|x| serde_json::from_value::<i64>(x.value).unwrap_or(1));
 
@@ -1940,7 +1875,7 @@ async fn handle_queued_job(
                     "UPDATE metrics SET value = $1 WHERE id = 'email_trigger_usage' AND created_at > NOW() - INTERVAL '1 day'",
                     serde_json::json!(count + 1)
                 )
-                .execute(db)
+                .execute(conn)
                 .warn_after_seconds(5)
                 .await?;
             }
@@ -1948,25 +1883,27 @@ async fn handle_queued_job(
             sqlx::query!(
                 "INSERT INTO metrics (id, value) VALUES ('email_trigger_usage', to_jsonb(1))"
             )
-            .execute(db)
+            .execute(conn)
             .warn_after_seconds(5)
             .await?;
         }
     }
 
-    if job.is_flow_step {
-        let _ = update_flow_status_in_progress(
-            db,
-            &job.workspace_id,
-            job.parent_job
-                .ok_or_else(|| Error::internal_err(format!("expected parent job")))?,
-            job.id,
-        )
-        .warn_after_seconds(5)
-        .await?;
-    } else if let Some(parent_job) = job.parent_job {
-        let _ = sqlx::query_scalar!(
-            "UPDATE v2_job_status SET
+    match conn {
+        Connection::Sql(db) => {
+            if job.is_flow_step {
+                let _ = update_flow_status_in_progress(
+                    db,
+                    &job.workspace_id,
+                    job.parent_job
+                        .ok_or_else(|| Error::internal_err(format!("expected parent job")))?,
+                    job.id,
+                )
+                .warn_after_seconds(5)
+                .await?;
+            } else if let Some(parent_job) = job.parent_job {
+                let _ = sqlx::query_scalar!(
+                    "UPDATE v2_job_status SET
                 workflow_as_code_status = jsonb_set(
                     jsonb_set(
                         COALESCE(workflow_as_code_status, '{}'::jsonb),
@@ -1977,18 +1914,21 @@ async fn handle_queued_job(
                     to_jsonb(now()::text)
                 )
             WHERE id = $2",
-            &job.id.to_string(),
-            parent_job
-        )
-        .execute(db)
-        .warn_after_seconds(5)
-        .await
-        .inspect_err(|e| {
-            tracing::error!(
-                "Could not update parent job `started_at` in workflow as code status: {}",
-                e
-            )
-        });
+                    &job.id.to_string(),
+                    parent_job
+                )
+                .execute(db)
+                .warn_after_seconds(5)
+                .await
+                .inspect_err(|e| {
+                    tracing::error!(
+                        "Could not update parent job `started_at` in workflow as code status: {}",
+                        e
+                    )
+                });
+            }
+        }
+        Connection::Http => todo!(),
     }
 
     let started = Instant::now();
@@ -2005,7 +1945,7 @@ async fn handle_queued_job(
             x,
         ) => match x.map(|x| x.0) {
             None | Some(PREVIEW_IS_CODEBASE_HASH) | Some(PREVIEW_IS_TAR_CODEBASE_HASH) => {
-                Some(cache::job::fetch_preview(db, &job.id, raw_lock, raw_code, raw_flow).await?)
+                Some(cache::job::fetch_preview(conn, &job.id, raw_lock, raw_code, raw_flow).await?)
             }
             _ => None,
         },
@@ -2013,7 +1953,15 @@ async fn handle_queued_job(
     };
 
     let cached_res_path = if job.cache_ttl.is_some() {
-        Some(cached_result_path(db, &client.get_authed().await, &job, preview_data.as_ref()).await)
+        Some(
+            cached_result_path(
+                conn,
+                &client.get_authed().await,
+                &job,
+                preview_data.as_ref(),
+            )
+            .await,
+        )
     } else {
         None
     };
@@ -2022,7 +1970,7 @@ async fn handle_queued_job(
         let authed_client = client.get_authed().await;
 
         let cached_result_maybe = get_cached_resource_value_if_valid(
-            db,
+            conn,
             &authed_client,
             &job.id,
             &job.workspace_id,
@@ -2034,7 +1982,7 @@ async fn handle_queued_job(
             {
                 let logs =
                     "Job skipped because args & path found in cache and not expired".to_string();
-                append_logs(&job.id, &job.workspace_id, logs, db).await;
+                append_logs(&job.id, &job.workspace_id, logs, conn).await;
             }
             job_completed_tx
                 .send(JobCompleted {
@@ -2058,12 +2006,12 @@ async fn handle_queued_job(
         let flow_data = match preview_data {
             Some(RawData::Flow(data)) => data,
             // Not a preview: fetch from the cache or the database.
-            _ => cache::job::fetch_flow(db, job.job_kind, job.script_hash).await?,
+            _ => cache::job::fetch_flow(conn, job.job_kind, job.script_hash).await?,
         };
         handle_flow(
             job,
             &flow_data,
-            db,
+            conn,
             &client.get_authed().await,
             None,
             same_worker_tx,
@@ -2109,7 +2057,7 @@ async fn handle_queued_job(
             "handling job {}",
             job.id
         );
-        append_logs(&job.id, &job.workspace_id, logs, db).await;
+        append_logs(&job.id, &job.workspace_id, logs, conn).await;
 
         let mut column_order: Option<Vec<String>> = None;
         let mut new_args: Option<HashMap<String, Box<RawValue>>> = None;
@@ -2121,7 +2069,7 @@ async fn handle_queued_job(
                     &mut mem_peak,
                     &mut canceled_by,
                     job_dir,
-                    db,
+                    conn,
                     worker_name,
                     worker_dir,
                     base_internal_url,
@@ -2137,7 +2085,7 @@ async fn handle_queued_job(
                     &mut mem_peak,
                     &mut canceled_by,
                     job_dir,
-                    db,
+                    conn,
                     worker_name,
                     worker_dir,
                     base_internal_url,
@@ -2151,7 +2099,7 @@ async fn handle_queued_job(
                 &mut mem_peak,
                 &mut canceled_by,
                 job_dir,
-                db,
+                conn,
                 worker_name,
                 worker_dir,
                 base_internal_url,
@@ -2176,7 +2124,7 @@ async fn handle_queued_job(
                 let r = handle_code_execution_job(
                     job.as_ref(),
                     preview_data,
-                    db,
+                    conn,
                     client,
                     job_dir,
                     worker_dir,
@@ -2219,7 +2167,7 @@ async fn handle_queued_job(
             client.get_token().await,
             column_order,
             new_args,
-            db,
+            conn,
             Some(started.elapsed().as_millis() as i64),
         )
         .await

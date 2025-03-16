@@ -6,7 +6,7 @@ pub async fn queue_init_job(worker_name: &str, content: &str) -> anyhow::Result<
     let url = format!("{}/agent_workers/queue_init_job", BASE_URL.read().await);
     let response = client
         .post(url)
-        .json(&QueueInitJob { content })
+        .json(&QueueInitJob { worker_name: worker_name.to_string(), content: content.to_string() })
         .send()
         .await?;
     let status = response.status();

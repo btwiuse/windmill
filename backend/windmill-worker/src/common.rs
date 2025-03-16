@@ -19,7 +19,7 @@ use windmill_common::s3_helpers::{
 };
 use windmill_common::variables::{build_crypt_with_key_suffix, decrypt};
 use windmill_common::worker::{
-    to_raw_value, write_file, CLOUD_HOSTED, ROOT_CACHE_DIR, WORKER_CONFIG,
+    to_raw_value, write_file, Connection, CLOUD_HOSTED, ROOT_CACHE_DIR, WORKER_CONFIG,
 };
 use windmill_common::{
     cache::{Cache, RawData},
@@ -482,24 +482,31 @@ pub fn sizeof_val(v: &serde_json::Value) -> usize {
 }
 
 pub async fn update_worker_ping_for_failed_init_script(
-    db: &DB,
+    conn: &Connection,
     worker_name: &str,
     last_job_id: Uuid,
 ) {
-    if let Err(e) = sqlx::query!(
-        "UPDATE worker_ping SET 
+    match conn {
+        Connection::Sql(db) => {
+            if let Err(e) = sqlx::query!(
+                "UPDATE worker_ping SET 
         ping_at = now(), 
         jobs_executed = 1, 
         current_job_id = $1, 
         current_job_workspace_id = 'admins' 
         WHERE worker = $2",
-        last_job_id,
-        worker_name
-    )
-    .execute(db)
-    .await
-    {
-        tracing::error!("Error updating worker ping for failed init script: {e:?}");
+                last_job_id,
+                worker_name
+            )
+            .execute(db)
+            .await
+            {
+                tracing::error!("Error updating worker ping for failed init script: {e:?}");
+            }
+        }
+        Connection::Http => {
+            todo!()
+        }
     }
 }
 pub struct OccupancyMetrics {

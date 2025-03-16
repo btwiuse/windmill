@@ -114,25 +114,32 @@ pub const ROOT_CACHE_NOMOUNT_DIR: &str = concatcp!(TMP_DIR, "/cache_nomount/");
 pub static MIN_VERSION_IS_LATEST: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
-pub enum ConnectionMode {
+pub enum Connection {
     Sql(Pool<Postgres>),
     Http,
 }
 
-impl From<Pool<Postgres>> for ConnectionMode {
+impl From<Pool<Postgres>> for Connection {
     fn from(value: Pool<Postgres>) -> Self {
-        ConnectionMode::Sql(value)
+        Connection::Sql(value)
     }
 }
 
-impl From<&Pool<Postgres>> for ConnectionMode {
+impl From<&Pool<Postgres>> for Connection {
     fn from(value: &Pool<Postgres>) -> Self {
-        ConnectionMode::Sql(value.clone())
+        Connection::Sql(value.clone())
     }
 }
 
-impl std::borrow::Borrow<ConnectionMode> for Pool<Postgres> {
-    fn borrow(&self) -> &ConnectionMode {
+impl From<&Pool<Postgres>> for &Connection {
+    fn from(value: &Pool<Postgres>) -> Self {
+        // This is safe because we never expose the reference and immediately convert it
+        unsafe { std::mem::transmute(value) }
+    }
+}
+
+impl std::borrow::Borrow<Connection> for Pool<Postgres> {
+    fn borrow(&self) -> &Connection {
         // This is safe because we never expose the reference and immediately convert it
         unsafe { std::mem::transmute(self) }
     }
@@ -710,7 +717,7 @@ pub async fn update_min_version<'c, E: sqlx::Executor<'c, Database = sqlx::Postg
     min_version >= cur_version
 }
 
-pub async fn update_ping(worker_instance: &str, worker_name: &str, ip: &str, db: &ConnectionMode) {
+pub async fn update_ping(worker_instance: &str, worker_name: &str, ip: &str, db: &Connection) {
     let (tags, dw) = {
         let wc = WORKER_CONFIG.read().await.clone();
         (
@@ -725,7 +732,7 @@ pub async fn update_ping(worker_instance: &str, worker_name: &str, ip: &str, db:
     let memory = get_memory();
 
     match db {
-        ConnectionMode::Sql(pool) => {
+        Connection::Sql(pool) => {
             sqlx::query!(
                 "INSERT INTO worker_ping (worker_instance, worker, ip, custom_tags, worker_group, dedicated_worker, wm_version, vcpus, memory) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (worker) DO UPDATE set ip = $3, custom_tags = $4, worker_group = $5",
                 worker_instance,
@@ -742,7 +749,7 @@ pub async fn update_ping(worker_instance: &str, worker_name: &str, ip: &str, db:
                 .await
                 .expect("insert worker_ping initial value");
         }
-        ConnectionMode::Http => {
+        Connection::Http => {
             tracing::error!("Cannot update ping in http mode");
         }
     }
