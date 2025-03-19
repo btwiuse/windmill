@@ -57,7 +57,7 @@ use windmill_common::{
     cache::{self, RawData},
     error::{self, to_anyhow, Error},
     flows::FlowNodeId,
-    jobs::{JobKind, QueuedJob},
+    jobs::JobKind,
     scripts::{get_full_hub_script_by_path, ScriptHash, ScriptLang, PREVIEW_IS_CODEBASE_HASH},
     users::SUPERADMIN_SECRET_EMAIL,
     utils::StripPath,
@@ -66,7 +66,7 @@ use windmill_common::{
 };
 
 use windmill_queue::{
-    append_logs, canceled_job_to_result, empty_result, pull, push, push_init_job, CanceledBy,
+    append_logs, canceled_job_to_result, empty_result, pull, push, CanceledBy, MiniPulledJob,
     PulledJob, PushArgs, PushIsolationLevel, HTTP_CLIENT,
 };
 
@@ -156,7 +156,7 @@ use windmill_common::add_time;
 
 pub async fn create_token_for_owner_in_bg(
     conn: &Connection,
-    job: &QueuedJob,
+    job: &MiniPulledJob,
 ) -> Arc<RwLock<String>> {
     let rw_lock = Arc::new(RwLock::new(String::new()));
     // skipping test runs
@@ -165,7 +165,7 @@ pub async fn create_token_for_owner_in_bg(
         let conn = conn.clone();
         let w_id = job.workspace_id.clone();
         let owner = job.permissioned_as.clone();
-        let email = job.email.clone();
+        let email = job.permissioned_as_email.clone();
         let job_id = job.id.clone();
 
         let label = if job.permissioned_as != format!("u/{}", job.created_by)
@@ -723,8 +723,8 @@ async fn insert_wait_time(
 }
 
 fn add_outstanding_wait_time(
-    queued_job: &QueuedJob,
     conn: &Connection,
+    queued_job: &MiniPulledJob,
     waiting_threshold: i64,
 ) -> () {
     let wait_time;
@@ -1095,7 +1095,7 @@ pub async fn run_worker(
 
     #[cfg(feature = "enterprise")]
     let (dedicated_workers, is_flow_worker, dedicated_handles): (
-        HashMap<String, Sender<Arc<QueuedJob>>>,
+        HashMap<String, Sender<Arc<MiniPulledJob>>>,
         bool,
         Vec<JoinHandle<()>>,
     ) = match conn {
@@ -1116,7 +1116,7 @@ pub async fn run_worker(
 
     #[cfg(not(feature = "enterprise"))]
     let (dedicated_workers, is_flow_worker, dedicated_handles): (
-        HashMap<String, Sender<Arc<QueuedJob>>>,
+        HashMap<String, Sender<Arc<MiniPulledJob>>>,
         bool,
         Vec<JoinHandle<()>>,
     ) = (HashMap::new(), false, vec![]);
@@ -1250,15 +1250,66 @@ pub async fn run_worker(
 
             if let Ok(same_worker_job) = same_worker_rx.try_recv() {
                 same_worker_queue_size.fetch_sub(1, Ordering::SeqCst);
-                let r = pull_same_worker_job(
-                    &conn,
-                    &worker_name,
-                    &hostname,
-                    same_worker_job,
-                    &job_completed_tx,
+                tracing::debug!(
+                    worker = %worker_name, hostname = %hostname,
+                    "received {} from same worker channel",
+                    same_worker_job.job_id
+                );
+                let r = sqlx::query_as::<_, PulledJob>(
+                    "WITH ping AS (
+                        UPDATE v2_job_runtime SET ping = NOW() WHERE id = $1 
+                    ),
+                    started_at AS (
+                        UPDATE v2_job_queue SET started_at = NOW() WHERE id = $1
+                    )
+                    SELECT 
+                    v2_job_queue.workspace_id,
+                    v2_job_queue.id,
+                    v2_job.args,
+                    v2_job.parent_job,
+                    v2_job.created_by,
+                    v2_job_queue.started_at,
+                    scheduled_for,
+                    runnable_path,
+                    kind,
+                    runnable_id,
+                    canceled_reason,
+                    canceled_by,
+                    permissioned_as,
+                    permissioned_as_email,
+                    flow_status,
+                    v2_job.tag,
+                    script_lang,
+                    same_worker,
+                    pre_run_error,
+                    concurrent_limit,
+                    concurrency_time_window_s,
+                    flow_innermost_root_job,
+                    timeout,
+                    flow_step_id,
+                    cache_ttl,
+                    v2_job_queue.priority,
+                    preprocessed,
+                    script_entrypoint_override,
+                    trigger,
+                    trigger_kind,
+                    visible_to_owner,
+                    raw_code,
+                    raw_lock,
+                    raw_flow
+                    FROM v2_job_queue INNER JOIN v2_job ON v2_job.id = v2_job_queue.id LEFT JOIN v2_job_status ON v2_job_status.id = v2_job_queue.id WHERE v2_job_queue.id = $1
+                    ",
                 )
-                .await;
-
+                .bind(same_worker_job.job_id)
+                .fetch_optional(db)
+                .await
+                .map_err(|e| {
+                    Error::internal_err(format!(
+                        "Impossible to fetch same_worker job {}: {}",
+                        same_worker_job.job_id, e
+                    ))
+                });
+                // tracing::error!("r: {:?}", r);
                 if r.is_err() && !same_worker_job.recoverable {
                     tracing::error!(
                         worker = %worker_name, hostname = %hostname,
@@ -1382,12 +1433,12 @@ pub async fn run_worker(
 
                 tracing::debug!(worker = %worker_name, hostname = %hostname, "started handling of job {}", job.id);
 
-                if matches!(job.job_kind, JobKind::Script | JobKind::Preview) {
+                if matches!(job.kind, JobKind::Script | JobKind::Preview) {
                     if !dedicated_workers.is_empty() {
                         let key_o = if is_flow_worker {
                             job.flow_step_id.as_ref().map(|x| x.to_string())
                         } else {
-                            job.script_path.as_ref().map(|x| x.to_string())
+                            job.runnable_path.as_ref().map(|x| x.to_string())
                         };
                         if let Some(key) = key_o {
                             if let Some(dedicated_worker_tx) = dedicated_workers.get(&key) {
@@ -1406,7 +1457,7 @@ pub async fn run_worker(
                         }
                     }
                 }
-                if matches!(job.job_kind, JobKind::Noop) {
+                if matches!(job.kind, JobKind::Noop) {
                     add_time!(bench, "send job completed START");
                     job_completed_tx
                         .send(JobCompleted {
@@ -1472,7 +1523,7 @@ pub async fn run_worker(
                     .await;
 
                     let job_root = job
-                        .root_job
+                        .flow_innermost_root_job
                         .map(|x| x.to_string())
                         .unwrap_or_else(|| "none".to_string());
 
@@ -1493,7 +1544,7 @@ pub async fn run_worker(
 
                     let same_worker = job.same_worker;
 
-                    let folder = if job.language == Some(ScriptLang::Go) {
+                    let folder = if job.script_lang == Some(ScriptLang::Go) {
                         DirBuilder::new()
                             .recursive(true)
                             .create(&format!("{job_dir}/go"))
@@ -1544,12 +1595,12 @@ pub async fn run_worker(
                             language = field::Empty,
                             script_path = field::Empty, flow_step_id = field::Empty, parent_job = field::Empty,
                             otel.name = field::Empty);
-                    let rj = if let Some(root_job) = arc_job.root_job {
+                    let rj = if let Some(root_job) = arc_job.flow_innermost_root_job {
                         root_job
                     } else {
                         arc_job.id
                     };
-                    if let Some(lg) = arc_job.language.as_ref() {
+                    if let Some(lg) = arc_job.script_lang.as_ref() {
                         span.record("language", lg.as_str());
                     }
                     if let Some(step_id) = arc_job.flow_step_id.as_ref() {
@@ -1561,10 +1612,10 @@ pub async fn run_worker(
                     if let Some(parent_job) = arc_job.parent_job.as_ref() {
                         span.record("parent_job", parent_job.to_string().as_str());
                     }
-                    if let Some(script_path) = arc_job.script_path.as_ref() {
+                    if let Some(script_path) = arc_job.runnable_path.as_ref() {
                         span.record("script_path", script_path.as_str());
                     }
-                    if let Some(root_job) = arc_job.root_job.as_ref() {
+                    if let Some(root_job) = arc_job.flow_innermost_root_job.as_ref() {
                         span.record("root_job", root_job.to_string().as_str());
                     }
 
@@ -1777,7 +1828,7 @@ pub enum SendResult {
 
 #[derive(Debug, Clone)]
 pub struct JobCompleted {
-    pub job: Arc<QueuedJob>,
+    pub job: Arc<MiniPulledJob>,
     pub result: Arc<Box<RawValue>>,
     pub result_columns: Option<Vec<String>>,
     pub mem_peak: i32,
@@ -1789,7 +1840,7 @@ pub struct JobCompleted {
 }
 
 async fn do_nativets(
-    job: &QueuedJob,
+    job: &MiniPulledJob,
     client: &AuthedClientBackgroundTask,
     env_code: String,
     code: String,
@@ -1831,7 +1882,7 @@ pub struct PreviousResult<'a> {
 }
 
 async fn handle_queued_job(
-    job: Arc<QueuedJob>,
+    job: Arc<MiniPulledJob>,
     raw_code: Option<String>,
     raw_lock: Option<String>,
     raw_flow: Option<Json<Box<RawValue>>>,
@@ -1850,7 +1901,7 @@ async fn handle_queued_job(
 ) -> windmill_common::error::Result<bool> {
     // Extract the active span from the context
 
-    if job.canceled {
+    if job.canceled_by.is_some() {
         return Err(Error::JsonErr(canceled_job_to_result(&job)));
     }
     if let Some(e) = &job.pre_run_error {
@@ -1889,6 +1940,7 @@ async fn handle_queued_job(
         }
     }
 
+<<<<<<< HEAD
     match conn {
         Connection::Sql(db) => {
             if job.is_flow_step {
@@ -1904,6 +1956,21 @@ async fn handle_queued_job(
             } else if let Some(parent_job) = job.parent_job {
                 let _ = sqlx::query_scalar!(
                     "UPDATE v2_job_status SET
+=======
+    if job.is_flow_step() {
+        let _ = update_flow_status_in_progress(
+            db,
+            &job.workspace_id,
+            job.parent_job
+                .ok_or_else(|| Error::internal_err(format!("expected parent job")))?,
+            job.id,
+        )
+        .warn_after_seconds(5)
+        .await?;
+    } else if let Some(parent_job) = job.parent_job {
+        let _ = sqlx::query_scalar!(
+            "UPDATE v2_job_status SET
+>>>>>>> main
                 workflow_as_code_status = jsonb_set(
                     jsonb_set(
                         COALESCE(workflow_as_code_status, '{}'::jsonb),
@@ -1935,7 +2002,7 @@ async fn handle_queued_job(
     // Pre-fetch preview jobs raw values if necessary.
     // The `raw_*` values passed to this function are the original raw values from `queue` tables,
     // they are kept for backward compatibility as they have been moved to the `job` table.
-    let preview_data = match (job.job_kind, job.script_hash) {
+    let preview_data = match (job.kind, job.runnable_id) {
         (
             JobKind::Preview
             | JobKind::Dependencies
@@ -2006,7 +2073,11 @@ async fn handle_queued_job(
         let flow_data = match preview_data {
             Some(RawData::Flow(data)) => data,
             // Not a preview: fetch from the cache or the database.
+<<<<<<< HEAD
             _ => cache::job::fetch_flow(conn, job.job_kind, job.script_hash).await?,
+=======
+            _ => cache::job::fetch_flow(db, job.kind, job.runnable_id).await?,
+>>>>>>> main
         };
         handle_flow(
             job,
@@ -2061,7 +2132,7 @@ async fn handle_queued_job(
 
         let mut column_order: Option<Vec<String>> = None;
         let mut new_args: Option<HashMap<String, Box<RawValue>>> = None;
-        let result = match job.job_kind {
+        let result = match job.kind {
             JobKind::Dependencies => {
                 handle_dependency_job(
                     &job,
@@ -2248,7 +2319,7 @@ pub async fn get_script_content_by_hash(
 
 #[tracing::instrument(level = "trace", skip_all)]
 async fn handle_code_execution_job(
-    job: &QueuedJob,
+    job: &MiniPulledJob,
     preview: Option<Arc<ScriptData>>,
     db: &sqlx::Pool<sqlx::Postgres>,
     client: &AuthedClientBackgroundTask,
@@ -2264,7 +2335,7 @@ async fn handle_code_execution_job(
     killpill_rx: &mut tokio::sync::broadcast::Receiver<()>,
 ) -> error::Result<Box<RawValue>> {
     let script_hash = || {
-        job.script_hash
+        job.runnable_id
             .ok_or_else(|| Error::internal_err("expected script hash"))
     };
     let (arc_data, arc_metadata, data, metadata): (
@@ -2273,11 +2344,9 @@ async fn handle_code_execution_job(
         ScriptData,
         ScriptMetadata,
     );
-    let (ScriptData { code, lock }, ScriptMetadata { language, envs, codebase }) = match job
-        .job_kind
-    {
+    let (ScriptData { code, lock }, ScriptMetadata { language, envs, codebase }) = match job.kind {
         JobKind::Preview => {
-            let codebase = match job.script_hash.map(|x| x.0) {
+            let codebase = match job.runnable_id.map(|x| x.0) {
                 Some(PREVIEW_IS_CODEBASE_HASH) => Some(job.id.to_string()),
                 Some(PREVIEW_IS_TAR_CODEBASE_HASH) => Some(format!("{}.tar", job.id)),
                 _ => None,
@@ -2285,12 +2354,13 @@ async fn handle_code_execution_job(
 
             arc_data =
                 preview.ok_or_else(|| Error::internal_err("expected preview".to_string()))?;
-            metadata = ScriptMetadata { language: job.language, codebase, envs: None };
+            metadata = ScriptMetadata { language: job.script_lang, codebase, envs: None };
             (arc_data.as_ref(), &metadata)
         }
         JobKind::Script_Hub => {
             let ContentReqLangEnvs { content, lockfile, language, envs, codebase } =
-                get_hub_script_content_and_requirements(job.script_path.as_ref(), Some(db)).await?;
+                get_hub_script_content_and_requirements(job.runnable_path.as_ref(), Some(db))
+                    .await?;
             data = ScriptData { code: content, lock: lockfile };
             metadata = ScriptMetadata { language, envs, codebase };
             (&data, &metadata)
@@ -2301,17 +2371,17 @@ async fn handle_code_execution_job(
         }
         JobKind::FlowScript => {
             arc_data = cache::flow::fetch_script(db, FlowNodeId(script_hash()?.0)).await?;
-            metadata = ScriptMetadata { language: job.language, envs: None, codebase: None };
+            metadata = ScriptMetadata { language: job.script_lang, envs: None, codebase: None };
             (arc_data.as_ref(), &metadata)
         }
         JobKind::AppScript => {
             arc_data = cache::app::fetch_script(db, AppScriptId(script_hash()?.0)).await?;
-            metadata = ScriptMetadata { language: job.language, envs: None, codebase: None };
+            metadata = ScriptMetadata { language: job.script_lang, envs: None, codebase: None };
             (arc_data.as_ref(), &metadata)
         }
         JobKind::DeploymentCallback => {
             let script_path = job
-                .script_path
+                .runnable_path
                 .as_ref()
                 .ok_or_else(|| Error::internal_err("expected script path".to_string()))?;
             if script_path.starts_with("hub/") {
@@ -2340,7 +2410,7 @@ async fn handle_code_execution_job(
         ),
     };
 
-    let language = *language;
+    let language = language.clone();
     if language == Some(ScriptLang::Postgresql) {
         return do_postgresql(
             job,
@@ -2535,7 +2605,7 @@ async fn handle_code_execution_job(
     }
 
     let lang_str = job
-        .language
+        .script_lang
         .as_ref()
         .map(|x| format!("{x:?}"))
         .unwrap_or_else(|| "NO_LANG".to_string());
@@ -2547,8 +2617,8 @@ async fn handle_code_execution_job(
         job.id
     );
 
-    let shared_mount = if job.same_worker && job.language != Some(ScriptLang::Deno) {
-        let folder = if job.language == Some(ScriptLang::Go) {
+    let shared_mount = if job.same_worker && job.script_lang != Some(ScriptLang::Deno) {
+        let folder = if job.script_lang == Some(ScriptLang::Go) {
             "/go"
         } else {
             ""
