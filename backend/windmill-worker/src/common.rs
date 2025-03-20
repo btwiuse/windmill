@@ -47,10 +47,10 @@ use crate::{
 pub async fn build_args_map<'a>(
     job: &'a MiniPulledJob,
     client: &AuthedClientBackgroundTask,
-    db: &Pool<Postgres>,
+    conn: &Connection,
 ) -> error::Result<Option<HashMap<String, Box<RawValue>>>> {
     if let Some(args) = &job.args {
-        return transform_json(client, &job.workspace_id, &args.0, &job, db).await;
+        return transform_json(client, &job.workspace_id, &args.0, &job, conn).await;
     }
     return Ok(None);
 }

@@ -731,7 +731,7 @@ pub async fn resolve_maybe_value<T>(
 }
 
 /// Resolve modules recursively.
-pub async fn resolve_value(
+async fn resolve_value(
     e: &sqlx::PgPool,
     workspace_id: &str,
     value: &mut Box<JsonRawValue>,

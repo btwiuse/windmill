@@ -39,6 +39,7 @@ mod python_executor;
 mod result_processor;
 #[cfg(feature = "rust")]
 mod rust_executor;
+mod schema;
 mod worker;
 mod worker_flow;
 mod worker_lockfiles;

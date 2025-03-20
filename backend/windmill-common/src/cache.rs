@@ -8,9 +8,13 @@
 //!   and there is only one test per thread, so using thread-local cache avoid unexpected results.
 
 use crate::{
-    apps::AppScriptId, error, flows::FlowNodeId, flows::FlowValue, scripts::ScriptHash,
-    scripts::ScriptLang,
+    apps::AppScriptId,
+    error,
+    flows::{FlowNodeId, FlowValue},
+    schema::SchemaValidator,
+    scripts::{ScriptHash, ScriptLang},
 };
+use anyhow::anyhow;
 
 #[cfg(feature = "scoped_cache")]
 use std::thread::ThreadId;
@@ -307,6 +311,8 @@ pub struct ScriptMetadata {
     pub language: Option<ScriptLang>,
     pub envs: Option<Vec<String>>,
     pub codebase: Option<String>,
+    pub schema: Option<String>,
+    pub schema_validator: Option<SchemaValidator>,
 }
 
 #[derive(Debug)]
@@ -529,6 +535,8 @@ pub mod script {
                     lock AS \"lock: String\", \
                     language AS \"language: Option<ScriptLang>\", \
                     envs AS \"envs: Vec<String>\", \
+                    schema AS \"schema: String\", \
+                    schema_validation AS \"schema_validation: bool\", \
                     codebase LIKE '%.tar' as use_tar \
                 FROM script WHERE hash = $1 LIMIT 1",
                 hash.0
@@ -537,23 +545,36 @@ pub mod script {
             .await
             .map_err(Into::into)
             .and_then(unwrap_or_error(&loc, "Script", hash))
-            .map(|r| RawScript {
-                content: r.content,
-                lock: r.lock,
-                meta: Some(ScriptMetadata {
-                    language: r.language,
-                    envs: r.envs,
-                    codebase: if let Some(use_tar) = r.use_tar {
-                        let sh = hash.to_string();
-                        if use_tar {
-                            Some(format!("{sh}.tar"))
+            .and_then(|r| {
+                Ok(RawScript {
+                    content: r.content,
+                    lock: r.lock,
+                    meta: Some(ScriptMetadata {
+                        language: r.language,
+                        envs: r.envs,
+                        codebase: if let Some(use_tar) = r.use_tar {
+                            let sh = hash.to_string();
+                            if use_tar {
+                                Some(format!("{sh}.tar"))
+                            } else {
+                                Some(sh)
+                            }
                         } else {
-                            Some(sh)
-                        }
-                    } else {
-                        None
-                    },
-                }),
+                            None
+                        },
+                        schema_validator: if r.schema_validation {
+                            r.schema
+                                .as_ref()
+                                .map(|schema_str| {
+                                    SchemaValidator::from_schema(schema_str).map_err(|e| anyhow!("Couldn't create schema validator for script requiring schema validation: {e}"))
+                                })
+                                .transpose()?
+                        } else {
+                            None
+                        },
+                        schema: r.schema,
+                    }),
+                })
             })
         });
         fut.map_ok(|ScriptFull { data, meta }| (data, meta))
@@ -608,7 +629,7 @@ pub mod app {
 
 pub mod job {
     use super::*;
-    use crate::{jobs::JobKind, worker::Connection};
+    use crate::{jobs::JobKind, worker::Connection, DB};
 
     #[cfg(not(feature = "scoped_cache"))]
     lazy_static! {
@@ -629,13 +650,13 @@ pub mod job {
 
     #[track_caller]
     pub fn fetch_preview_flow<'a>(
-        conn: &'a Connection,
+        db: &'a DB,
         job: &'a Uuid,
         // original raw values from `queue` or `completed_job` tables:
         // kept for backward compatibility.
         raw_flow: Option<Json<Box<RawValue>>>,
     ) -> impl Future<Output = error::Result<Arc<FlowData>>> + 'a {
-        let fetch_preview = fetch_preview(conn, job, None, None, raw_flow);
+        let fetch_preview = fetch_preview(db.into(), job, None, None, raw_flow);
         async move {
             fetch_preview.await.and_then(|data| match data {
                 RawData::Flow(data) => Ok(data),
@@ -944,6 +965,7 @@ const _: () = {
         (u64, |x| format!("{:016x}", x)),
         (Uuid, |x| format!("{:032x}", x.as_u128())),
         (ScriptHash, |x| format!("{:016x}", x.0)),
+        ((u8, ScriptHash), |x| format!("{:02x}-{:016x}", x.0, x.1.0)),
         (FlowNodeId, |x| format!("{:016x}", x.0)),
         (AppScriptId, |x| format!("{:016x}", x.0))
     }

@@ -15,7 +15,7 @@ use tokio::process::Command;
 use uuid::Uuid;
 use windmill_common::{
     error::Error,
-    worker::{to_raw_value, write_file},
+    worker::{to_raw_value, write_file, Connection},
 };
 
 #[cfg(feature = "dind")]
@@ -341,7 +341,7 @@ async fn handle_docker_job(
                                 tracing::error!("Error getting logs: {:?}", e);
                             }
                             _ => {
-                                tracing::error!("End of stream");
+                                tracing::info!("End of docker logs stream");
                                 return
                             }
                         };
@@ -470,7 +470,7 @@ pub async fn handle_powershell_job(
     mem_peak: &mut i32,
     canceled_by: &mut Option<CanceledBy>,
     job: &MiniPulledJob,
-    db: &sqlx::Pool<sqlx::Postgres>,
+    db: &Connection,
     client: &AuthedClientBackgroundTask,
     content: &str,
     job_dir: &str,
@@ -481,7 +481,7 @@ pub async fn handle_powershell_job(
     occupancy_metrics: &mut OccupancyMetrics,
 ) -> Result<Box<RawValue>, Error> {
     let pwsh_args = {
-        let args = build_args_map(job, client, db).await?.map(Json);
+        let args = build_args_map(job, client, &db).await?.map(Json);
         let job_args = if args.is_some() {
             args.as_ref()
         } else {
