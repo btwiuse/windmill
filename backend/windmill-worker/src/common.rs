@@ -416,7 +416,7 @@ pub fn capitalize(s: &str) -> String {
 pub async fn get_reserved_variables(
     job: &MiniPulledJob,
     token: &str,
-    db: &sqlx::Pool<sqlx::Postgres>,
+    db: &Connection,
 ) -> Result<HashMap<String, String>, Error> {
     let flow_path = if let Some(uuid) = job.parent_job {
         sqlx::query_scalar!("SELECT runnable_path FROM v2_job WHERE id = $1", uuid)

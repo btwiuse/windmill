@@ -63,7 +63,7 @@ pub async fn handle_bash_job(
     mem_peak: &mut i32,
     canceled_by: &mut Option<CanceledBy>,
     job: &MiniPulledJob,
-    db: &sqlx::Pool<sqlx::Postgres>,
+    db: &Connection,
     client: &AuthedClientBackgroundTask,
     content: &str,
     job_dir: &str,
