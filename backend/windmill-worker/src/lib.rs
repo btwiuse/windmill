@@ -10,6 +10,8 @@ mod agent_workers;
 mod ansible_executor;
 mod bash_executor;
 
+#[cfg(feature = "nu")]
+mod nu_executor;
 #[cfg(feature = "benchmark")]
 pub mod bench;
 mod bun_executor;
@@ -43,7 +45,12 @@ mod schema;
 mod worker;
 mod worker_flow;
 mod worker_lockfiles;
+<<<<<<< HEAD
 mod worker_utils;
+=======
+mod sanitized_sql_params;
+mod schema;
+>>>>>>> main
 
 pub use worker::*;
 
