@@ -20,9 +20,9 @@ use crate::{
         read_file_content, read_result, start_child_process, write_file_binary, OccupancyMetrics,
     },
     handle_child::handle_child,
-    AuthedClientBackgroundTask, BUNFIG_INSTALL_SCOPES, BUN_BUNDLE_CACHE_DIR, BUN_CACHE_DIR,
-    BUN_PATH, DISABLE_NSJAIL, DISABLE_NUSER, HOME_ENV, NODE_BIN_PATH, NODE_PATH,
-    NPM_CONFIG_REGISTRY, NPM_PATH, NSJAIL_PATH, PATH_ENV, PROXY_ENVS, TZ_ENV,
+    AuthedClient, BUNFIG_INSTALL_SCOPES, BUN_BUNDLE_CACHE_DIR, BUN_CACHE_DIR, BUN_PATH,
+    DISABLE_NSJAIL, DISABLE_NUSER, HOME_ENV, NODE_BIN_PATH, NODE_PATH, NPM_CONFIG_REGISTRY,
+    NPM_PATH, NSJAIL_PATH, PATH_ENV, PROXY_ENVS, TZ_ENV,
 };
 
 #[cfg(windows)]
@@ -42,7 +42,7 @@ use windmill_common::{
     error::{self, Result},
     get_latest_hash_for_path,
     scripts::ScriptLang,
-    worker::{exists_in_cache, save_cache, write_file, DISABLE_BUNDLING},
+    worker::{exists_in_cache, save_cache, write_file, Connection, DISABLE_BUNDLING},
     DB,
 };
 
@@ -96,7 +96,7 @@ pub async fn gen_bun_lockfile(
     canceled_by: &mut Option<CanceledBy>,
     job_id: &Uuid,
     w_id: &str,
-    db: Option<&sqlx::Pool<sqlx::Postgres>>,
+    db: Option<&Connection>,
     token: &str,
     script_path: &str,
     job_dir: &str,
@@ -272,7 +272,7 @@ pub async fn install_bun_lockfile(
     canceled_by: &mut Option<CanceledBy>,
     job_id: &Uuid,
     w_id: &str,
-    db: Option<&sqlx::Pool<sqlx::Postgres>>,
+    db: Option<&Connection>,
     job_dir: &str,
     worker_name: &str,
     common_bun_proc_envs: HashMap<String, String>,
@@ -486,7 +486,7 @@ pub async fn generate_wrapper_mjs(
     w_id: &str,
     job_id: &Uuid,
     worker_name: &str,
-    db: &sqlx::Pool<sqlx::Postgres>,
+    db: &Connection,
     timeout: Option<i32>,
     mem_peak: &mut i32,
     canceled_by: &mut Option<CanceledBy>,
@@ -535,7 +535,7 @@ pub async fn generate_bun_bundle(
     w_id: &str,
     job_id: &Uuid,
     worker_name: &str,
-    db: Option<sqlx::Pool<sqlx::Postgres>>,
+    db: Option<&Connection>,
     timeout: Option<i32>,
     mem_peak: &mut i32,
     canceled_by: &mut Option<CanceledBy>,
@@ -676,7 +676,7 @@ pub async fn prebundle_bun_script(
     script_path: &str,
     job_id: &Uuid,
     w_id: &str,
-    db: Option<DB>,
+    db: Option<&Connection>,
     job_dir: &str,
     base_internal_url: &str,
     worker_name: &str,
@@ -756,7 +756,7 @@ async fn compute_bundle_local_and_remote_path(
     inner_content: &str,
     requirements_o: Option<&String>,
     script_path: &str,
-    db: Option<DB>,
+    db: Option<&Connection>,
     w_id: &str,
 ) -> (String, String) {
     let mut input_src = format!(
@@ -825,7 +825,8 @@ pub async fn handle_bun_job(
     canceled_by: &mut Option<CanceledBy>,
     job: &MiniPulledJob,
     db: &sqlx::Pool<sqlx::Postgres>,
-    client: &AuthedClientBackgroundTask,
+    client: &AuthedClient,
+    parent_runnable_path: Option<String>,
     job_dir: &str,
     inner_content: &String,
     base_internal_url: &str,
@@ -934,7 +935,7 @@ pub async fn handle_bun_job(
             &job.id,
             &job.workspace_id,
             Some(db),
-            &client.get_token().await,
+            &client.token,
             job.runnable_path(),
             job_dir,
             base_internal_url,
@@ -1108,8 +1109,7 @@ try {{
             Ok(()) as Result<()>
         };
         let reserved_variables_f = async {
-            let client = client.get_authed().await;
-            let vars = get_reserved_variables(job, &client.token, db).await?;
+            let vars = get_reserved_variables(job, &client.token, db, parent_runnable_path).await?;
             Ok(vars) as Result<HashMap<String, String>>
         };
         let (_, reserved_variables) = tokio::try_join!(args_and_out_f, reserved_variables_f)?;
@@ -1127,7 +1127,7 @@ try {{
             build_loader(
                 job_dir,
                 base_internal_url,
-                &client.get_token().await,
+                &client.token,
                 &job.workspace_id,
                 job.runnable_path(),
                 if annotation.nodejs {
@@ -1145,7 +1145,7 @@ try {{
             build_loader(
                 job_dir,
                 base_internal_url,
-                &client.get_token().await,
+                &client.token,
                 &job.workspace_id,
                 job.runnable_path(),
                 if annotation.nodejs {

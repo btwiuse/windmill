@@ -15,7 +15,9 @@ use windmill_common::error::to_anyhow;
 
 use windmill_common::error::{self, Error};
 
-use windmill_common::worker::{get_windmill_memory_usage, get_worker_memory_usage, CLOUD_HOSTED};
+use windmill_common::worker::{
+    get_windmill_memory_usage, get_worker_memory_usage, Connection, CLOUD_HOSTED,
+};
 
 use windmill_queue::{append_logs, CanceledBy};
 
@@ -92,7 +94,7 @@ async fn kill_process_tree(pid: Option<u32>) -> Result<(), String> {
 #[tracing::instrument(name="run_subprocess", level = "info", skip_all, fields(otel.name = %child_name))]
 pub async fn handle_child(
     job_id: &Uuid,
-    db: &Pool<Postgres>,
+    db: &Connection,
     mem_peak: &mut i32,
     canceled_by_ref: &mut Option<CanceledBy>,
     mut child: Child,
@@ -490,7 +492,7 @@ pub(crate) async fn get_mem_peak(pid: Option<u32>, nsjail: bool) -> i32 {
 pub async fn run_future_with_polling_update_job_poller<Fut, T, S>(
     job_id: Uuid,
     timeout: Option<i32>,
-    db: &DB,
+    conn: &Connection,
     mem_peak: &mut i32,
     canceled_by_ref: &mut Option<CanceledBy>,
     result_f: Fut,
@@ -507,7 +509,7 @@ where
 
     let update_job = update_job_poller(
         job_id,
-        db,
+        conn,
         mem_peak,
         canceled_by_ref,
         get_mem,
@@ -518,7 +520,7 @@ where
     );
 
     let timeout_ms = u64::try_from(
-        resolve_job_timeout(&db, &w_id, job_id, timeout)
+        resolve_job_timeout(&conn, &w_id, job_id, timeout)
             .await
             .0
             .as_millis(),
@@ -553,7 +555,7 @@ pub enum UpdateJobPollingExit {
 
 pub async fn update_job_poller<S>(
     job_id: Uuid,
-    db: &DB,
+    conn: &Connection,
     mem_peak: &mut i32,
     canceled_by_ref: &mut Option<CanceledBy>,
     mut get_mem: S,
@@ -567,8 +569,7 @@ where
 {
     let update_job_interval = Duration::from_millis(500);
 
-    let db = db.clone();
-
+    let conn = conn.clone();
     let mut interval = interval(update_job_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
