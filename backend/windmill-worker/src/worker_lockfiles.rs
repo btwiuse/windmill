@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fs::{create_dir_all, remove_dir_all};
 use std::path::{Component, Path, PathBuf};
 
 use async_recursion::async_recursion;
@@ -1058,6 +1059,12 @@ async fn lock_modules<'c>(
 
         modified_ids.push(e.id.clone());
 
+        remove_dir_all(job_dir).map_err(|e| {
+            Error::ExecutionErr(format!("Error removing job dir for flow step lock: {e}"))
+        })?;
+        create_dir_all(job_dir).map_err(|e| {
+            Error::ExecutionErr(format!("Error creating job dir for flow step lock: {e}"))
+        })?;
         let new_lock = capture_dependency_job(
             &job.id,
             &language,
