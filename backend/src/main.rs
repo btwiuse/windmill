@@ -957,7 +957,9 @@ Windmill Community Edition {GIT_VERSION}
                                 last_listener_refresh = Instant::now();
                             }
 
-                            tracing::info!("monitor task started");
+                            if server_mode {
+                                tracing::info!("monitor task started");
+                            }
                             monitor_db(
                                 &db,
                                 &base_internal_url,
@@ -967,7 +969,9 @@ Windmill Community Edition {GIT_VERSION}
                                 tx.clone(),
                             )
                             .await;
-                            tracing::info!("monitor task finished");
+                            if server_mode {
+                                tracing::info!("monitor task finished");
+                            }
                         },
                     }
                 }
