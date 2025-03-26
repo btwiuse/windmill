@@ -778,7 +778,7 @@ pub async fn run_worker(
 
     #[cfg(feature = "python")]
     {
-        let (db, worker_name, hostname, worker_dir) = (
+        let (conn, worker_name, hostname, worker_dir) = (
             conn.clone(),
             worker_name.clone(),
             hostname.to_owned(),
@@ -1057,19 +1057,21 @@ pub async fn run_worker(
     let same_worker_tx = SameWorkerSender(same_worker_tx, same_worker_queue_size.clone());
     let job_completed_processor_is_done = Arc::new(AtomicBool::new(false));
 
-    let send_result = start_background_processor(
-        job_completed_rx,
-        job_completed_tx.0.clone(),
-        same_worker_queue_size.clone(),
-        job_completed_processor_is_done.clone(),
-        base_internal_url.to_string(),
-        conn.clone(),
-        worker_dir.clone(),
-        same_worker_tx.clone(),
-        worker_name.clone(),
-        killpill_tx.clone(),
-        is_dedicated_worker,
-    );
+    let send_result = conn.as_sql().map(|db| {
+        start_background_processor(
+            job_completed_rx,
+            job_completed_tx.0.clone(),
+            same_worker_queue_size.clone(),
+            job_completed_processor_is_done.clone(),
+            base_internal_url.to_string(),
+            db.clone(),
+            worker_dir.clone(),
+            same_worker_tx.clone(),
+            worker_name.clone(),
+            killpill_tx.clone(),
+            is_dedicated_worker,
+        )
+    });
 
     let mut last_executed_job: Option<Instant> = None;
 
@@ -1249,102 +1251,32 @@ pub async fn run_worker(
             }
 
             if let Ok(same_worker_job) = same_worker_rx.try_recv() {
-                match conn {
+                same_worker_queue_size.fetch_sub(1, Ordering::SeqCst);
+                tracing::debug!(
+                    worker = %worker_name, hostname = %hostname,
+                    "received {} from same worker channel",
+                    same_worker_job.job_id
+                );
+                match &conn {
                     Connection::Sql(db) => {
-                        same_worker_queue_size.fetch_sub(1, Ordering::SeqCst);
-                        tracing::debug!(
-                                    worker = %worker_name, hostname = %hostname,
-                            "received {} from same worker channel",
-                            same_worker_job.job_id
-                        );
-                        let r = sqlx::query_as::<_, PulledJob>(
-                    "WITH ping AS (
-                        UPDATE v2_job_runtime SET ping = NOW() WHERE id = $1 
-                    ),
-                    started_at AS (
-                        UPDATE v2_job_queue SET started_at = NOW() WHERE id = $1
-                    )
-                    SELECT 
-                    v2_job_queue.workspace_id,
-                    v2_job_queue.id,
-                    v2_job.args,
-                    v2_job.parent_job,
-                    v2_job.created_by,
-                    v2_job_queue.started_at,
-                    scheduled_for,
-                    v2_job.runnable_path,
-                    v2_job.kind,
-                    v2_job.runnable_id,
-                    v2_job_queue.canceled_reason,
-                    v2_job_queue.canceled_by,
-                    v2_job.permissioned_as,
-                    v2_job.permissioned_as_email,
-                    v2_job_status.flow_status,
-                    v2_job.tag,
-                    v2_job.script_lang,
-                    v2_job.same_worker,
-                    v2_job.pre_run_error,
-                    v2_job.concurrent_limit,
-                    v2_job.concurrency_time_window_s,
-                    v2_job.flow_innermost_root_job,
-                    v2_job.timeout,
-                    v2_job.flow_step_id,
-                    v2_job.cache_ttl,
-                    v2_job_queue.priority,
-                    v2_job.preprocessed,
-                    v2_job.script_entrypoint_override,
-                    v2_job.trigger,
-                    v2_job.trigger_kind,
-                    v2_job.visible_to_owner,
-                    v2_job.raw_code,
-                    v2_job.raw_lock,
-                    v2_job.raw_flow,
-                    pj.runnable_path as parent_runnable_path,
-                    p.email as permissioned_as_email, p.username as permissioned_as_username, p.is_admin as permissioned_as_is_admin, 
-                    p.is_operator as permissioned_as_is_operator, p.groups as permissioned_as_groups, p.folders as permissioned_as_folders
-                    FROM v2_job_queue 
-                    INNER JOIN v2_job ON v2_job.id = v2_job_queue.id 
-                    LEFT JOIN v2_job_status ON v2_job_status.id = v2_job_queue.id
-                    LEFT JOIN job_perms p ON p.job_id = v2_job.id
-                    LEFT JOIN v2_job pj ON v2_job.parent_job = pj.id
-                    WHERE v2_job_queue.id = $1
-",
-                )
-                .bind(same_worker_job.job_id)
-                .fetch_optional(db)
-                .await
-                .map_err(|e| {
-                    Error::internal_err(format!(
-                        "Impossible to fetch same_worker job {}: {}",
-                        same_worker_job.job_id, e
-                    ))
-                });
+                        let job = get_same_worker_job(db, &same_worker_job).await;
                         // tracing::error!("r: {:?}", r);
-                        if r.is_err() && !same_worker_job.recoverable {
+                        if job.is_err() && !same_worker_job.recoverable {
                             tracing::error!(
                                 worker = %worker_name, hostname = %hostname,
                                 "failed to fetch same_worker job on a non recoverable job, exiting"
                             );
                             job_completed_tx
-                                .kill()
+                                .0
+                                .send(SendResult::Kill)
                                 .await
                                 .expect("send kill to job completed tx");
                             break;
                         } else {
-                            r
+                            job
                         }
                     }
-                    Connection::Http => {
-                        tracing::error!(
-                            worker = %worker_name, hostname = %hostname,
-                            "cannot fetch same worker job in http mode"
-                        );
-                        job_completed_tx
-                            .kill()
-                            .await
-                            .expect("send kill to job completed tx");
-                        break;
-                    }
+                    Connection::Http => panic!("same worker job on http connection"),
                 }
             } else if let Ok(_) = killpill_rx.try_recv() {
                 if !killed_but_draining_same_worker_jobs {
@@ -1707,22 +1639,29 @@ pub async fn run_worker(
                     .await
                     {
                         Err(err) => {
-                            handle_job_error(
-                                conn,
-                                &authed_client,
-                                arc_job.as_ref(),
-                                0,
-                                None,
-                                err,
-                                false,
-                                same_worker_tx.clone(),
-                                &worker_dir,
-                                &worker_name,
-                                (&job_completed_tx.0).clone(),
-                                #[cfg(feature = "benchmark")]
-                                &mut bench,
-                            )
-                            .await;
+                            match conn {
+                                Connection::Sql(db) => {
+                                    handle_job_error(
+                                        db,
+                                        &authed_client,
+                                        arc_job.as_ref(),
+                                        0,
+                                        None,
+                                        err,
+                                        false,
+                                        same_worker_tx.clone(),
+                                        &worker_dir,
+                                        &worker_name,
+                                        (&job_completed_tx.0).clone(),
+                                        #[cfg(feature = "benchmark")]
+                                        &mut bench,
+                                    )
+                                    .await;
+                                }
+                                Connection::Http => {
+                                    todo!()
+                                }
+                            }
                             if is_init_script {
                                 tracing::error!("init script job failed (in handler), exiting");
                                 update_worker_ping_for_failed_init_script(
@@ -1846,11 +1785,81 @@ pub async fn run_worker(
     drop(job_completed_tx);
 
     tracing::info!(worker = %worker_name, hostname = %hostname, "waiting for job_completed_processor to finish processing remaining jobs");
-    if let Err(e) = send_result.await {
-        tracing::error!("error in awaiting send_result process: {e:?}")
+    if let Some(send_result) = send_result {
+        if let Err(e) = send_result.await {
+            tracing::error!("error in awaiting send_result process: {e:?}")
+        }
     }
     tracing::info!(worker = %worker_name, hostname = %hostname, "worker {} exited", worker_name);
     tracing::info!(worker = %worker_name, hostname = %hostname, "number of jobs executed: {}", jobs_executed);
+}
+
+async fn get_same_worker_job(
+    db: &DB,
+    same_worker_job: &SameWorkerPayload,
+) -> windmill_common::error::Result<Option<PulledJob>> {
+    sqlx::query_as::<_, PulledJob>(
+        "WITH ping AS (
+                        UPDATE v2_job_runtime SET ping = NOW() WHERE id = $1 
+                    ),
+                    started_at AS (
+                        UPDATE v2_job_queue SET started_at = NOW() WHERE id = $1
+                    )
+                    SELECT 
+                    v2_job_queue.workspace_id,
+                    v2_job_queue.id,
+                    v2_job.args,
+                    v2_job.parent_job,
+                    v2_job.created_by,
+                    v2_job_queue.started_at,
+                    scheduled_for,
+                    v2_job.runnable_path,
+                    v2_job.kind,
+                    v2_job.runnable_id,
+                    v2_job_queue.canceled_reason,
+                    v2_job_queue.canceled_by,
+                    v2_job.permissioned_as,
+                    v2_job.permissioned_as_email,
+                    v2_job_status.flow_status,
+                    v2_job.tag,
+                    v2_job.script_lang,
+                    v2_job.same_worker,
+                    v2_job.pre_run_error,
+                    v2_job.concurrent_limit,
+                    v2_job.concurrency_time_window_s,
+                    v2_job.flow_innermost_root_job,
+                    v2_job.timeout,
+                    v2_job.flow_step_id,
+                    v2_job.cache_ttl,
+                    v2_job_queue.priority,
+                    v2_job.preprocessed,
+                    v2_job.script_entrypoint_override,
+                    v2_job.trigger,
+                    v2_job.trigger_kind,
+                    v2_job.visible_to_owner,
+                    v2_job.raw_code,
+                    v2_job.raw_lock,
+                    v2_job.raw_flow,
+                    pj.runnable_path as parent_runnable_path,
+                    p.email as permissioned_as_email, p.username as permissioned_as_username, p.is_admin as permissioned_as_is_admin, 
+                    p.is_operator as permissioned_as_is_operator, p.groups as permissioned_as_groups, p.folders as permissioned_as_folders
+                    FROM v2_job_queue 
+                    INNER JOIN v2_job ON v2_job.id = v2_job_queue.id 
+                    LEFT JOIN v2_job_status ON v2_job_status.id = v2_job_queue.id
+                    LEFT JOIN job_perms p ON p.job_id = v2_job.id
+                    LEFT JOIN v2_job pj ON v2_job.parent_job = pj.id
+                    WHERE v2_job_queue.id = $1
+",
+    )
+    .bind(same_worker_job.job_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        Error::internal_err(format!(
+            "Impossible to fetch same_worker job {}: {}",
+            same_worker_job.job_id, e
+        ))
+    })
 }
 
 async fn queue_init_bash_maybe<'c>(
@@ -1977,7 +1986,7 @@ async fn handle_queued_job(
             if job.parent_job.is_none() && job.created_by.starts_with("email-") {
                 let daily_count = sqlx::query!(
             "SELECT value FROM metrics WHERE id = 'email_trigger_usage' AND created_at > NOW() - INTERVAL '1 day' ORDER BY created_at DESC LIMIT 1"
-        ).fetch_optional(conn)
+        ).fetch_optional(db)
         .warn_after_seconds(5)
         .await?.map(|x| serde_json::from_value::<i64>(x.value).unwrap_or(1));
 
@@ -1991,7 +2000,7 @@ async fn handle_queued_job(
                     "UPDATE metrics SET value = $1 WHERE id = 'email_trigger_usage' AND created_at > NOW() - INTERVAL '1 day'",
                     serde_json::json!(count + 1)
                 )
-                .execute(conn)
+                .execute(db)
                 .warn_after_seconds(5)
                 .await?;
                     }
@@ -1999,7 +2008,7 @@ async fn handle_queued_job(
                     sqlx::query!(
                 "INSERT INTO metrics (id, value) VALUES ('email_trigger_usage', to_jsonb(1))"
             )
-                    .execute(conn)
+                    .execute(db)
                     .warn_after_seconds(5)
                     .await?;
                 }
@@ -2007,7 +2016,8 @@ async fn handle_queued_job(
         }
         Connection::Http => {
             return Err(Error::internal_err(format!(
-                "Could not check email trigger usage for job with agent worker{job_id}"
+                "Could not check email trigger usage for job with agent worker {}",
+                job.id
             )))
         }
     }
@@ -2076,65 +2086,78 @@ async fn handle_queued_job(
     };
 
     let cached_res_path = if job.cache_ttl.is_some() {
-        Some(cached_result_path(conn, &client, &job, preview_data.as_ref()).await)
+        match conn {
+            Connection::Sql(db) => {
+                Some(cached_result_path(db, &client, &job, preview_data.as_ref()).await)
+            }
+            Connection::Http => None,
+        }
     } else {
         None
     };
 
-    if let Some(cached_res_path) = cached_res_path.as_ref() {
-        let cached_result_maybe = get_cached_resource_value_if_valid(
-            conn,
-            &client,
-            &job.id,
-            &job.workspace_id,
-            &cached_res_path,
-        )
-        .warn_after_seconds(5)
-        .await;
-        if let Some(result) = cached_result_maybe {
-            {
-                let logs =
-                    "Job skipped because args & path found in cache and not expired".to_string();
-                append_logs(&job.id, &job.workspace_id, logs, conn).await;
-            }
-            job_completed_tx
-                .send(JobCompleted {
-                    job,
-                    result,
-                    result_columns: None,
-                    mem_peak: 0,
-                    canceled_by: None,
-                    success: true,
-                    cached_res_path: None,
-                    token: client.token.clone(),
-                    duration: None,
-                })
-                .await
-                .expect("send job completed");
+    if let Some(db) = conn.as_sql() {
+        if let Some(cached_res_path) = cached_res_path.as_ref() {
+            let cached_result_maybe = get_cached_resource_value_if_valid(
+                db,
+                &client,
+                &job.id,
+                &job.workspace_id,
+                &cached_res_path,
+            )
+            .warn_after_seconds(5)
+            .await;
+            if let Some(result) = cached_result_maybe {
+                {
+                    let logs = "Job skipped because args & path found in cache and not expired"
+                        .to_string();
+                    append_logs(&job.id, &job.workspace_id, logs, conn).await;
+                }
+                job_completed_tx
+                    .send(JobCompleted {
+                        job,
+                        result,
+                        result_columns: None,
+                        mem_peak: 0,
+                        canceled_by: None,
+                        success: true,
+                        cached_res_path: None,
+                        token: client.token.clone(),
+                        duration: None,
+                    })
+                    .await
+                    .expect("send job completed");
 
-            return Ok(true);
-        }
-    };
-    if job.is_flow() {
-        let flow_data = match preview_data {
-            Some(RawData::Flow(data)) => data,
-            // Not a preview: fetch from the cache or the database.
-            _ => cache::job::fetch_flow(conn, job.job_kind, job.script_hash).await?,
+                return Ok(true);
+            }
         };
-        handle_flow(
-            job,
-            &flow_data,
-            conn,
-            &client,
-            None,
-            same_worker_tx,
-            worker_dir,
-            job_completed_tx.0.clone(),
-            worker_name,
-        )
-        .warn_after_seconds(10)
-        .await?;
-        Ok(true)
+    }
+    if job.is_flow() {
+        if let Some(db) = conn.as_sql() {
+            let flow_data = match preview_data {
+                Some(RawData::Flow(data)) => data,
+                // Not a preview: fetch from the cache or the database.
+                _ => cache::job::fetch_flow(db, job.kind, job.runnable_id).await?,
+            };
+            handle_flow(
+                job,
+                &flow_data,
+                db,
+                &client,
+                None,
+                same_worker_tx,
+                worker_dir,
+                job_completed_tx.0.clone(),
+                worker_name,
+            )
+            .warn_after_seconds(10)
+            .await?;
+            Ok(true)
+        } else {
+            return Err(Error::internal_err(
+                "Could not handle flow job with agent worker".to_string(),
+            ));
+        }
     } else {
         let mut logs = "".to_string();
         let mut mem_peak: i32 = 0;
@@ -2175,14 +2198,58 @@ async fn handle_queued_job(
         let mut column_order: Option<Vec<String>> = None;
         let mut new_args: Option<HashMap<String, Box<RawValue>>> = None;
         let result = match job.kind {
-            JobKind::Dependencies => {
-                handle_dependency_job(
+            JobKind::Dependencies => match conn {
+                Connection::Sql(db) => {
+                    handle_dependency_job(
+                        &job,
+                        preview_data.as_ref(),
+                        &mut mem_peak,
+                        &mut canceled_by,
+                        job_dir,
+                        db,
+                        worker_name,
+                        worker_dir,
+                        base_internal_url,
+                        &client.token,
+                        occupancy_metrics,
+                    )
+                    .await
+                }
+                Connection::Http => {
+                    // requeue with default language
+                    todo!()
+                }
+            },
+            JobKind::FlowDependencies => match conn {
+                Connection::Sql(db) => {
+                    handle_flow_dependency_job(
+                        &job,
+                        preview_data.as_ref(),
+                        &mut mem_peak,
+                        &mut canceled_by,
+                        job_dir,
+                        db,
+                        worker_name,
+                        worker_dir,
+                        base_internal_url,
+                        &client.token,
+                        occupancy_metrics,
+                    )
+                    .await
+                }
+                Connection::Http => {
+                    return Err(Error::internal_err(
+                        "Could not handle flow dependency job with agent worker".to_string(),
+                    ));
+                }
+            },
+            JobKind::AppDependencies => match conn {
+                Connection::Sql(db) => handle_app_dependency_job(
                     &job,
-                    preview_data.as_ref(),
                     &mut mem_peak,
                     &mut canceled_by,
                     job_dir,
-                    conn,
+                    db,
                     worker_name,
                     worker_dir,
                     base_internal_url,
@@ -2190,37 +2257,13 @@ async fn handle_queued_job(
                     occupancy_metrics,
                 )
                 .await
-            }
-            JobKind::FlowDependencies => {
-                handle_flow_dependency_job(
-                    &job,
-                    preview_data.as_ref(),
-                    &mut mem_peak,
-                    &mut canceled_by,
-                    job_dir,
-                    conn,
-                    worker_name,
-                    worker_dir,
-                    base_internal_url,
-                    &client.token,
-                    occupancy_metrics,
-                )
-                .await
-            }
-            JobKind::AppDependencies => handle_app_dependency_job(
-                &job,
-                &mut mem_peak,
-                &mut canceled_by,
-                job_dir,
-                conn,
-                worker_name,
-                worker_dir,
-                base_internal_url,
-                &client.token,
-                occupancy_metrics,
-            )
-            .await
-            .map(|()| serde_json::from_str("{}").unwrap()),
+                .map(|()| serde_json::from_str("{}").unwrap()),
+                Connection::Http => {
+                    return Err(Error::internal_err(
+                        "Could not handle app dependency job with agent worker".to_string(),
+                    ));
+                }
+            },
             JobKind::Identity => Ok(job
                 .args
                 .as_ref()
@@ -2270,21 +2313,29 @@ async fn handle_queued_job(
             return Ok(false);
         }
 
-        process_result(
-            job,
-            result.map(|x| Arc::new(x)),
-            job_dir,
-            job_completed_tx,
-            mem_peak,
-            canceled_by,
-            cached_res_path,
-            &client.token,
-            column_order,
-            new_args,
-            conn,
-            Some(started.elapsed().as_millis() as i64),
-        )
-        .await
+        match conn {
+            Connection::Sql(db) => {
+                process_result(
+                    job,
+                    result.map(|x| Arc::new(x)),
+                    job_dir,
+                    job_completed_tx,
+                    mem_peak,
+                    canceled_by,
+                    cached_res_path,
+                    &client.token,
+                    column_order,
+                    new_args,
+                    db,
+                    Some(started.elapsed().as_millis() as i64),
+                )
+                .await
+            }
+            Connection::Http => {
+                // send result back
+                todo!()
+            }
+        }
     }
 }
 
@@ -2346,9 +2397,9 @@ pub async fn get_hub_script_content_and_requirements(
 pub async fn get_script_content_by_hash(
     script_hash: &ScriptHash,
     _w_id: &str,
-    db: &DB,
+    conn: &Connection,
 ) -> error::Result<ContentReqLangEnvs> {
-    let (data, metadata) = cache::script::fetch(db, *script_hash).await?;
+    let (data, metadata) = cache::script::fetch(conn, *script_hash).await?;
     Ok(ContentReqLangEnvs {
         content: data.code.clone(),
         lockfile: data.lock.clone(),
@@ -2365,7 +2416,7 @@ pub async fn get_script_content_by_hash(
 
 async fn try_validate_schema(
     job: &MiniPulledJob,
-    db: &Pool<Postgres>,
+    conn: &Connection,
     schema_validator: Option<&SchemaValidator>,
     code: &str,
     language: Option<&ScriptLang>,
@@ -2426,7 +2477,7 @@ async fn try_validate_schema(
                     &job.id,
                     &job.workspace_id,
                     "\n--- ARGS VALIDATION ---\nScript contains `schema_validation` annotation, running schema validation for the script arguments...\n",
-                    db,
+                    conn,
                 )
                 .await;
             }
@@ -2441,7 +2492,7 @@ async fn try_validate_schema(
                     &job.id,
                     &job.workspace_id,
                     "Script arguments were validated!\n\n",
-                    db,
+                    conn,
                 )
                 .await;
             }
@@ -2455,7 +2506,7 @@ async fn try_validate_schema(
 async fn handle_code_execution_job(
     job: &MiniPulledJob,
     preview: Option<Arc<ScriptData>>,
-    db: &sqlx::Pool<sqlx::Postgres>,
+    conn: &Connection,
     client: &AuthedClient,
     parent_runnable_path: Option<String>,
     job_dir: &str,
@@ -2503,7 +2554,7 @@ async fn handle_code_execution_job(
         }
         JobKind::Script_Hub => {
             let ContentReqLangEnvs { content, lockfile, language, envs, codebase, schema } =
-                get_hub_script_content_and_requirements(job.runnable_path.as_ref(), Some(db))
+                get_hub_script_content_and_requirements(job.runnable_path.as_ref(), conn.as_sql())
                     .await?;
 
             data = ScriptData { code: content, lock: lockfile };
@@ -2511,58 +2562,74 @@ async fn handle_code_execution_job(
             (&data, &metadata)
         }
         JobKind::Script => {
-            (arc_data, arc_metadata) = cache::script::fetch(db, script_hash()?).await?;
+            (arc_data, arc_metadata) = cache::script::fetch(conn, script_hash()?).await?;
             (arc_data.as_ref(), arc_metadata.as_ref())
         }
         JobKind::FlowScript => {
-            arc_data = cache::flow::fetch_script(db, FlowNodeId(script_hash()?.0)).await?;
-            metadata = ScriptMetadata {
-                language: job.script_lang,
-                envs: None,
-                codebase: None,
-                schema: None,
-                schema_validator: None,
-            };
-            (arc_data.as_ref(), &metadata)
-        }
-        JobKind::AppScript => {
-            arc_data = cache::app::fetch_script(db, AppScriptId(script_hash()?.0)).await?;
-            metadata = ScriptMetadata {
-                language: job.script_lang,
-                envs: None,
-                codebase: None,
-                schema: None,
-                schema_validator: None,
-            };
-            (arc_data.as_ref(), &metadata)
-        }
-        JobKind::DeploymentCallback => {
-            let script_path = job
-                .runnable_path
-                .as_ref()
-                .ok_or_else(|| Error::internal_err("expected script path".to_string()))?;
-            if script_path.starts_with("hub/") {
-                let ContentReqLangEnvs { content, lockfile, language, envs, codebase, schema } =
-                    get_hub_script_content_and_requirements(Some(script_path), Some(db)).await?;
-                data = ScriptData { code: content, lock: lockfile };
-                metadata =
-                    ScriptMetadata { language, envs, codebase, schema, schema_validator: None };
-                (&data, &metadata)
+            if let Some(db) = conn.as_sql() {
+                arc_data = cache::flow::fetch_script(db, FlowNodeId(script_hash()?.0)).await?;
+                metadata = ScriptMetadata {
+                    language: job.script_lang,
+                    envs: None,
+                    codebase: None,
+                    schema: None,
+                    schema_validator: None,
+                };
+                (arc_data.as_ref(), &metadata)
             } else {
-                let hash = sqlx::query_scalar!(
-                    "SELECT hash FROM script WHERE path = $1 AND workspace_id = $2 AND
-                    deleted = false AND lock IS not NULL AND lock_error_logs IS NULL",
-                    script_path,
-                    &job.workspace_id
-                )
-                .fetch_optional(db)
-                .await?
-                .ok_or_else(|| Error::internal_err("expected script hash".to_string()))?;
-
-                (arc_data, arc_metadata) = cache::script::fetch(db, ScriptHash(hash)).await?;
-                (arc_data.as_ref(), arc_metadata.as_ref())
+                return Err(Error::internal_err("expected sql connection".to_string()));
             }
         }
+        JobKind::AppScript => {
+            if let Some(db) = conn.as_sql() {
+                arc_data = cache::app::fetch_script(db, AppScriptId(script_hash()?.0)).await?;
+                metadata = ScriptMetadata {
+                    language: job.script_lang,
+                    envs: None,
+                    codebase: None,
+                    schema: None,
+                    schema_validator: None,
+                };
+                (arc_data.as_ref(), &metadata)
+            } else {
+                return Err(Error::internal_err("expected sql connection".to_string()));
+            }
+        }
+        JobKind::DeploymentCallback => match conn {
+            Connection::Sql(db) => {
+                let script_path = job
+                    .runnable_path
+                    .as_ref()
+                    .ok_or_else(|| Error::internal_err("expected script path".to_string()))?;
+                if script_path.starts_with("hub/") {
+                    let ContentReqLangEnvs { content, lockfile, language, envs, codebase, schema } =
+                        get_hub_script_content_and_requirements(Some(script_path), conn.as_sql())
+                            .await?;
+                    data = ScriptData { code: content, lock: lockfile };
+                    metadata =
+                        ScriptMetadata { language, envs, codebase, schema, schema_validator: None };
+                    (&data, &metadata)
+                } else {
+                    let hash = sqlx::query_scalar!(
+                        "SELECT hash FROM script WHERE path = $1 AND workspace_id = $2 AND
+                    deleted = false AND lock IS not NULL AND lock_error_logs IS NULL",
+                        script_path,
+                        &job.workspace_id
+                    )
+                    .fetch_optional(db)
+                    .await?
+                    .ok_or_else(|| Error::internal_err("expected script hash".to_string()))?;
+
+                    (arc_data, arc_metadata) = cache::script::fetch(conn, ScriptHash(hash)).await?;
+                    (arc_data.as_ref(), arc_metadata.as_ref())
+                }
+            }
+            Connection::Http => {
+                return Err(Error::internal_err(
+                    "Could not handle deployment callback with agent worker".to_string(),
+                ));
+            }
+        },
         _ => unreachable!(
             "handle_code_execution_job should never be reachable with a non-code execution job"
         ),
@@ -2570,7 +2637,7 @@ async fn handle_code_execution_job(
 
     try_validate_schema(
         job,
-        db,
+        conn,
         schema_validator.as_ref(),
         code,
         language.as_ref(),
@@ -2584,7 +2651,7 @@ async fn handle_code_execution_job(
             job,
             &client,
             &code,
-            db,
+            conn,
             mem_peak,
             canceled_by,
             worker_name,
@@ -2603,7 +2670,7 @@ async fn handle_code_execution_job(
             job,
             &client,
             &code,
-            db,
+            conn,
             mem_peak,
             canceled_by,
             worker_name,
@@ -2633,7 +2700,7 @@ async fn handle_code_execution_job(
                 job,
                 &client,
                 &code,
-                db,
+                conn,
                 mem_peak,
                 canceled_by,
                 worker_name,
@@ -2656,7 +2723,7 @@ async fn handle_code_execution_job(
                 job,
                 &client,
                 &code,
-                db,
+                conn,
                 mem_peak,
                 canceled_by,
                 worker_name,
@@ -2687,7 +2754,7 @@ async fn handle_code_execution_job(
                 job,
                 &client,
                 &code,
-                db,
+                conn,
                 mem_peak,
                 canceled_by,
                 worker_name,
@@ -2717,7 +2784,7 @@ async fn handle_code_execution_job(
                 job,
                 &client,
                 &code,
-                db,
+                conn,
                 mem_peak,
                 canceled_by,
                 worker_name,
@@ -2731,7 +2798,7 @@ async fn handle_code_execution_job(
             job,
             &client,
             &code,
-            db,
+            conn,
             mem_peak,
             canceled_by,
             worker_name,
@@ -2763,7 +2830,7 @@ async fn handle_code_execution_job(
             &client,
             env_code,
             code.clone(),
-            db,
+            conn,
             mem_peak,
             canceled_by,
             worker_name,
@@ -2831,7 +2898,7 @@ mount {{
                 job,
                 mem_peak,
                 canceled_by,
-                db,
+                conn,
                 client,
                 parent_runnable_path,
                 &code,
@@ -2849,7 +2916,7 @@ mount {{
                 mem_peak,
                 canceled_by,
                 job,
-                db,
+                conn,
                 client,
                 parent_runnable_path,
                 job_dir,
@@ -2869,7 +2936,7 @@ mount {{
                 mem_peak,
                 canceled_by,
                 job,
-                db,
+                conn,
                 client,
                 parent_runnable_path,
                 job_dir,
@@ -2888,7 +2955,7 @@ mount {{
                 mem_peak,
                 canceled_by,
                 job,
-                db,
+                conn,
                 client,
                 parent_runnable_path,
                 &code,
@@ -2907,7 +2974,7 @@ mount {{
                 mem_peak,
                 canceled_by,
                 job,
-                db,
+                conn,
                 client,
                 parent_runnable_path,
                 &code,
@@ -2926,7 +2993,7 @@ mount {{
                 mem_peak,
                 canceled_by,
                 job,
-                db,
+                conn,
                 client,
                 parent_runnable_path,
                 &code,
@@ -2951,7 +3018,7 @@ mount {{
                 mem_peak,
                 canceled_by,
                 job,
-                db,
+                conn,
                 client,
                 parent_runnable_path,
                 job_dir,
@@ -2975,7 +3042,7 @@ mount {{
                 mem_peak,
                 canceled_by,
                 job,
-                db,
+                conn,
                 client,
                 parent_runnable_path,
                 &code,
@@ -3004,7 +3071,7 @@ mount {{
                 job,
                 mem_peak,
                 canceled_by,
-                db,
+                conn,
                 client,
                 parent_runnable_path,
                 &code,
@@ -3020,7 +3087,7 @@ mount {{
                 mem_peak,
                 canceled_by,
                 job,
-                db,
+                conn,
                 client,
                 parent_runnable_path,
                 &code,
@@ -3045,7 +3112,7 @@ mount {{
                 mem_peak,
                 canceled_by,
                 job,
-                db,
+                conn,
                 client,
                 parent_runnable_path,
                 inner_content: &code,

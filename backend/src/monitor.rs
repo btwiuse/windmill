@@ -45,9 +45,7 @@ use windmill_common::{
         REQUIRE_PREEXISTING_USER_FOR_OAUTH_SETTING, RETENTION_PERIOD_SECS_SETTING,
         SAML_METADATA_SETTING, SCIM_TOKEN_SETTING, TIMEOUT_WAIT_RESULT_SETTING,
     }, indexer::load_indexer_config, jobs::QueuedJob, jwt::JWT_SECRET, oauth2::REQUIRE_PREEXISTING_USER_FOR_OAUTH, server::load_smtp_config, tracing_init::JSON_FMT, users::truncate_token, utils::{now_from_db, rd_string, report_critical_error, Mode}, worker::{
-        load_worker_config, make_pull_query, make_suspended_pull_query, reload_custom_tags_setting,
-        update_min_version, DEFAULT_TAGS_PER_WORKSPACE, DEFAULT_TAGS_WORKSPACES, INDEXER_CONFIG,
-        SMTP_CONFIG, TMP_DIR, WORKER_CONFIG, WORKER_GROUP,
+        load_worker_config, make_pull_query, make_suspended_pull_query, reload_custom_tags_setting, update_min_version, Connection, DEFAULT_TAGS_PER_WORKSPACE, DEFAULT_TAGS_WORKSPACES, INDEXER_CONFIG, SMTP_CONFIG, TMP_DIR, WORKER_CONFIG, WORKER_GROUP
     }, KillpillSender, BASE_URL, CRITICAL_ALERT_MUTE_UI_ENABLED, CRITICAL_ERROR_CHANNELS, DB, DEFAULT_HUB_BASE_URL, HUB_BASE_URL, JOB_RETENTION_SECS, METRICS_DEBUG_ENABLED, METRICS_ENABLED, MONITOR_LOGS_ON_OBJECT_STORE, OTEL_LOGS_ENABLED, OTEL_METRICS_ENABLED, OTEL_TRACING_ENABLED, SERVICE_LOG_RETENTION_SECS
 };
 use windmill_queue::{cancel_job, MiniPulledJob};
@@ -117,7 +115,7 @@ lazy_static::lazy_static! {
 }
 
 pub async fn initial_load(
-    db: &Pool<Postgres>,
+    conn: &Connection,
     tx: KillpillSender,
     worker_mode: bool,
     server_mode: bool,
@@ -152,16 +150,19 @@ pub async fn initial_load(
         reload_worker_config(&db, tx, false).await;
     }
 
-    if let Err(e) = reload_custom_tags_setting(db).await {
-        tracing::error!("Error reloading custom tags: {:?}", e)
-    }
-
     if let Err(e) = reload_hub_base_url_setting(db, server_mode).await {
         tracing::error!("Error reloading hub base url: {:?}", e)
     }
 
-    if let Err(e) = reload_jwt_secret_setting(&db).await {
-        tracing::error!("Could not reload jwt secret setting: {:?}", e);
+    if let Some(db) = conn.as_sql() {
+        if let Err(e) = reload_jwt_secret_setting(db).await {
+            tracing::error!("Could not reload jwt secret setting: {:?}", e);
+        }
+
+        if let Err(e) = reload_custom_tags_setting(db).await {
+            tracing::error!("Error reloading custom tags: {:?}", e)
+        }
+
     }
 
     #[cfg(feature = "parquet")]
@@ -169,13 +170,19 @@ pub async fn initial_load(
         reload_s3_cache_setting(&db).await;
     }
 
-    reload_smtp_config(&db).await;
+    if let Some(db) = conn.as_sql() {
+        reload_smtp_config(db).await;
+    }
 
     if server_mode {
-        reload_retention_period_setting(&db).await;
-        reload_request_size(&db).await;
-        reload_saml_metadata_setting(&db).await;
-        reload_scim_token_setting(&db).await;
+        if let Some(db) = conn.as_sql() {
+            reload_retention_period_setting(&db).await;
+            reload_request_size(&db).await;
+            reload_saml_metadata_setting(&db).await;
+            reload_scim_token_setting(&db).await;
+        } else {
+            panic!("Server mode requires a database connection");
+        }
     }
 
     if worker_mode {
@@ -1087,8 +1094,8 @@ pub async fn reload_request_size(db: &DB) {
     }
 }
 
-pub async fn reload_license_key(db: &DB) -> anyhow::Result<()> {
-    let q = load_value_from_global_settings(db, LICENSE_KEY_SETTING)
+pub async fn reload_license_key(conn: &Connection) -> anyhow::Result<()> {
+    let q = load_value_from_global_settings_with_conn(conn, LICENSE_KEY_SETTING, true)
         .await
         .map_err(|err| anyhow::anyhow!("Error reloading license key: {}", err.to_string()))?;
 
@@ -1135,6 +1142,21 @@ pub async fn load_value_from_global_settings(
     .await?
     .map(|x| x.value);
     Ok(r)
+}
+
+
+pub async fn load_value_from_global_settings_with_conn(
+    conn: &Connection,
+    setting_name: &str,
+    load_from_http: bool,
+) -> error::Result<Option<serde_json::Value>> {
+    if let Some(db) = conn.as_sql() {
+       load_value_from_global_settings(db, setting_name).await
+    } else if load_from_http {
+        todo!()
+    } else {
+        Ok(None)
+    }
 }
 
 pub async fn reload_option_setting<T: FromStr + DeserializeOwned>(
@@ -1245,7 +1267,7 @@ pub async fn monitor_pool(db: &DB) {
 }
 
 pub async fn monitor_db(
-    db: &Pool<Postgres>,
+    conn: &Connection,
     base_internal_url: &str,
     server_mode: bool,
     _worker_mode: bool,
@@ -1255,18 +1277,22 @@ pub async fn monitor_db(
     tracing::info!("Starting periodic monitor task");
     let zombie_jobs_f = async {
         if server_mode && !initial_load {
-            handle_zombie_jobs(db, base_internal_url, "server").await;
-            match handle_zombie_flows(db).await {
-                Err(err) => {
-                    tracing::error!("Error handling zombie flows: {:?}", err);
+            if let Some(db) = conn.as_sql() {
+                handle_zombie_jobs(db, base_internal_url, "server").await;
+                match handle_zombie_flows(db).await {
+                    Err(err) => {
+                        tracing::error!("Error handling zombie flows: {:?}", err);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     };
     let expired_items_f = async {
         if server_mode && !initial_load {
+            if let Some(db) = conn.as_sql() {
             delete_expired_items(&db).await;
+            }
         }
     };
 
@@ -1279,35 +1305,43 @@ pub async fn monitor_db(
 
     let expose_queue_metrics_f = async {
         if !initial_load && server_mode {
-            expose_queue_metrics(&db).await;
+            if let Some(db) = conn.as_sql() {
+                expose_queue_metrics(&db).await;
+            }
         }
     };
 
     let worker_groups_alerts_f = async {
         #[cfg(feature = "enterprise")]
         if server_mode && !initial_load {
-            worker_groups_alerts(&db).await;
+            if let Some(db) = conn.as_sql() {
+                worker_groups_alerts(&db).await;
+            }
         }
     };
 
     let jobs_waiting_alerts_f = async {
         #[cfg(feature = "enterprise")]
         if server_mode {
-            jobs_waiting_alerts(&db).await;
+            if let Some(db) = conn.as_sql() {
+                jobs_waiting_alerts(&db).await;
+            }
         }
     };
 
     let apply_autoscaling_f = async {
         #[cfg(feature = "enterprise")]
         if server_mode && !initial_load {
-            if let Err(e) = windmill_autoscaling::apply_all_autoscaling(db).await {
-                tracing::error!("Error applying autoscaling: {:?}", e);
+            if let Some(db) = conn.as_sql() {
+                if let Err(e) = windmill_autoscaling::apply_all_autoscaling(db).await {
+                    tracing::error!("Error applying autoscaling: {:?}", e);
+                }
             }
         }
     };
 
     let update_min_worker_version_f = async {
-        update_min_version(db).await;
+        update_min_version(conn).await;
     };
 
     join!(
@@ -1472,8 +1506,8 @@ pub async fn reload_worker_config(
     }
 }
 
-pub async fn load_base_url(db: &DB) -> error::Result<String> {
-    let q_base_url = load_value_from_global_settings(db, BASE_URL_SETTING).await?;
+pub async fn load_base_url(conn: &Connection) -> error::Result<String> {
+    let q_base_url = load_value_from_global_settings_with_conn(conn, BASE_URL_SETTING, false).await?;
 
     let std_base_url = std::env::var("BASE_URL")
         .ok()
@@ -1503,26 +1537,28 @@ pub async fn load_base_url(db: &DB) -> error::Result<String> {
     Ok(base_url)
 }
 
-pub async fn reload_base_url_setting(db: &DB) -> error::Result<()> {
-    #[cfg(feature = "oauth2")]
-    let q_oauth = load_value_from_global_settings(db, OAUTH_SETTING).await?;
+pub async fn reload_base_url_setting(conn: &Connection) -> error::Result<()> {
 
-    #[cfg(feature = "oauth2")]
-    let oauths = if let Some(q) = q_oauth {
-        if let Ok(v) = serde_json::from_value::<
-            Option<HashMap<String, windmill_api::oauth2_ee::OAuthClient>>,
-        >(q.clone())
-        {
-            v
+    if let Some(db) = conn.as_sql() {
+        #[cfg(feature = "oauth2")]
+        let q_oauth = load_value_from_global_settings(db, OAUTH_SETTING).await?;
+
+        #[cfg(feature = "oauth2")]
+        let oauths = if let Some(q) = q_oauth {
+            if let Ok(v) = serde_json::from_value::<
+                Option<HashMap<String, windmill_api::oauth2_ee::OAuthClient>>,
+            >(q.clone())
+            {
+                v
+            } else {
+                tracing::error!("Could not parse oauth setting as a json, found: {:#?}", &q);
+                None
+            }
         } else {
-            tracing::error!("Could not parse oauth setting as a json, found: {:#?}", &q);
             None
-        }
-    } else {
-        None
-    };
-
-    let base_url = load_base_url(db).await?;
+        };
+    }
+    let base_url = load_base_url(conn).await?;
     let is_secure = base_url.starts_with("https://");
 
     #[cfg(feature = "oauth2")]
@@ -1798,7 +1834,7 @@ async fn handle_zombie_jobs(db: &Pool<Postgres>, base_internal_url: &str, worker
             "ephemeral-script".to_string()
         };
         let token = create_token_for_owner(
-            &db,
+            &db.into(),
             &job.workspace_id,
             &job.permissioned_as,
             &label,
@@ -2040,9 +2076,9 @@ pub async fn reload_hub_base_url_setting(db: &DB, server_mode: bool) -> error::R
     Ok(())
 }
 
-pub async fn reload_critical_error_channels_setting(db: &DB) -> error::Result<()> {
+pub async fn reload_critical_error_channels_setting(conn: &DB) -> error::Result<()> {
     let critical_error_channels =
-        load_value_from_global_settings(db, CRITICAL_ERROR_CHANNELS_SETTING).await?;
+        load_value_from_global_settings(conn, CRITICAL_ERROR_CHANNELS_SETTING).await?;
 
     let critical_error_channels = if let Some(q) = critical_error_channels {
         if let Ok(v) = serde_json::from_value::<Vec<CriticalErrorChannel>>(q.clone()) {

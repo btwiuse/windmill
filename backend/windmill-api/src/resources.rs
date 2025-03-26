@@ -33,6 +33,7 @@ use windmill_common::{
     error::{Error, JsonResult, Result},
     utils::{not_found_if_none, paginate, require_admin, Pagination, StripPath},
     variables,
+    worker::Connection,
 };
 
 pub fn workspaced_service() -> Router {
@@ -570,7 +571,7 @@ pub async fn transform_json_value<'c>(
             };
 
             let variables = variables::get_reserved_variables(
-                db,
+                &db.into(),
                 workspace,
                 token,
                 &job.email,

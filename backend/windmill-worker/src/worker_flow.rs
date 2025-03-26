@@ -1050,7 +1050,7 @@ pub async fn update_flow_status_after_job_completion_internal(
             } else {
                 "Flow job completed with error\n".to_string()
             };
-            append_logs(&flow_job.id, w_id, logs, db).await;
+            append_logs(&flow_job.id, w_id, logs, &db.into()).await;
         }
         #[cfg(feature = "enterprise")]
         if flow_job.parent_job.is_none() {
@@ -1168,7 +1168,7 @@ pub async fn update_flow_status_after_job_completion_internal(
                     &flow_job.id,
                     w_id,
                     format!("Unexpected error during flow chaining:\n{:#?}", e),
-                    db,
+                    &db.into(),
                 )
                 .await;
                 let _ = add_completed_job_error(db, &flow_job, 0, None, e, worker_name, true, None)
@@ -2105,7 +2105,13 @@ async fn push_next_flow_job(
 
                 let result: Value = json!({ "error": {"message": logs, "name": error_name}});
 
-                append_logs(&flow_job.id, &flow_job.workspace_id, logs.clone(), db).await;
+                append_logs(
+                    &flow_job.id,
+                    &flow_job.workspace_id,
+                    logs.clone(),
+                    &db.into(),
+                )
+                .await;
 
                 job_completed_tx
                     .send(SendResult::UpdateFlow {

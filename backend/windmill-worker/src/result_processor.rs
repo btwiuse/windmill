@@ -2,7 +2,7 @@
 use opentelemetry::trace::FutureExt;
 
 use serde::Serialize;
-use sqlx::{types::Json, Pool, Postgres};
+use sqlx::types::Json;
 use std::{
     collections::HashMap,
     sync::{
@@ -21,8 +21,8 @@ use windmill_common::{
     error::{self, Error},
     jobs::JobKind,
     utils::WarnAfterExt,
-    worker::{to_raw_value, Connection, WORKER_GROUP},
-    DB,
+    worker::{to_raw_value, WORKER_GROUP},
+    KillpillSender, DB,
 };
 
 #[cfg(feature = "benchmark")]
@@ -53,7 +53,7 @@ pub fn start_background_processor(
     same_worker_queue_size: Arc<AtomicU16>,
     job_completed_processor_is_done: Arc<AtomicBool>,
     base_internal_url: String,
-    db: Connection,
+    db: DB,
     worker_dir: String,
     same_worker_tx: SameWorkerSender,
     worker_name: String,
@@ -543,7 +543,7 @@ pub async fn process_completed_job(
 
 #[tracing::instrument(name = "job_error", level = "info", skip_all, fields(job_id = %job.id))]
 pub async fn handle_job_error(
-    conn: &Connection,
+    db: &DB,
     client: &AuthedClient,
     job: &MiniPulledJob,
     mem_peak: i32,
@@ -566,11 +566,11 @@ pub async fn handle_job_error(
             &job.id,
             &job.workspace_id,
             format!("Unexpected error during job execution:\n{err:#?}"),
-            conn,
+            &db.into(),
         )
         .await;
         add_completed_job_error(
-            conn,
+            db,
             job,
             mem_peak,
             canceled_by.clone(),
@@ -626,7 +626,7 @@ pub async fn handle_job_error(
                         &parent_job.id,
                         &job.workspace_id,
                         format!("Unexpected error during flow job error handling:\n{err}"),
-                        db,
+                        &db.into(),
                     )
                     .await;
                     let _ = add_completed_job_error(

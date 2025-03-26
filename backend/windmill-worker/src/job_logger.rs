@@ -1,6 +1,6 @@
 use regex::Regex;
 
-use windmill_common::worker::CLOUD_HOSTED;
+use windmill_common::worker::{Connection, CLOUD_HOSTED};
 
 use windmill_queue::append_logs;
 
@@ -29,30 +29,37 @@ pub(crate) async fn append_job_logs(
     job_id: Uuid,
     w_id: String,
     logs: String,
-    db: DB,
+    conn: Connection,
     must_compact_logs: bool,
     total_size: Arc<AtomicU32>,
     worker_name: String,
 ) -> () {
     if must_compact_logs {
-        #[cfg(all(feature = "enterprise", feature = "parquet"))]
-        s3_storage(job_id, &w_id, &db, logs, total_size, &worker_name).await;
+        match conn {
+            Connection::Sql(db) => {
+                #[cfg(all(feature = "enterprise", feature = "parquet"))]
+                s3_storage(job_id, &w_id, db, logs, total_size, &worker_name).await;
 
-        #[cfg(not(all(feature = "enterprise", feature = "parquet")))]
-        {
-            default_disk_log_storage(
-                job_id,
-                &w_id,
-                &db,
-                logs,
-                total_size,
-                CompactLogs::NotEE,
-                &worker_name,
-            )
-            .await;
+                #[cfg(not(all(feature = "enterprise", feature = "parquet")))]
+                {
+                    default_disk_log_storage(
+                        job_id,
+                        &w_id,
+                        &db,
+                        logs,
+                        total_size,
+                        CompactLogs::NotEE,
+                        &worker_name,
+                    )
+                    .await;
+                }
+            }
+            Connection::Http => {
+                todo!()
+            }
         }
     } else {
-        append_logs(&job_id, w_id, logs, db).await;
+        append_logs(&job_id, w_id, logs, conn).await;
     }
 }
 

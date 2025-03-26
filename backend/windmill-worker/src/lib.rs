@@ -43,7 +43,6 @@ mod result_processor;
 mod rust_executor;
 mod sanitized_sql_params;
 mod schema;
-mod schema;
 mod worker;
 mod worker_flow;
 mod worker_lockfiles;

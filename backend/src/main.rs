@@ -14,7 +14,7 @@ use monitor::{
     send_logs_to_object_store,
 };
 use rand::Rng;
-use sqlx::{postgres::PgListener, Pool, Postgres};
+use sqlx::postgres::PgListener;
 use std::{
     collections::HashMap,
     fs::{create_dir_all, DirBuilder},
@@ -46,7 +46,9 @@ use windmill_common::{
     scripts::ScriptLang,
     stats_ee::schedule_stats,
     utils::{hostname, rd_string, Mode, GIT_VERSION, MODE_AND_ADDONS},
-    worker::{reload_custom_tags_setting, HUB_CACHE_DIR, TMP_DIR, TMP_LOGS_DIR, WORKER_GROUP},
+    worker::{
+        reload_custom_tags_setting, Connection, HUB_CACHE_DIR, TMP_DIR, TMP_LOGS_DIR, WORKER_GROUP,
+    },
     KillpillSender, METRICS_ENABLED,
 };
 
@@ -351,23 +353,29 @@ async fn windmill_main() -> anyhow::Result<()> {
         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
     };
 
-    println!("Connecting to database...");
-    let db = windmill_common::initial_connection().await?;
+    let conn = if mode == Mode::Agent {
+        Connection::Http
+    } else {
+        println!("Connecting to database...");
 
-    let num_version = sqlx::query_scalar!("SELECT version()").fetch_one(&db).await;
+        let db = windmill_common::initial_connection().await?;
 
-    tracing::info!(
-        "PostgreSQL version: {} (windmill require PG >= 14)",
-        num_version
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "UNKNOWN".to_string())
-    );
-    load_otel(&db).await;
+        let num_version = sqlx::query_scalar!("SELECT version()").fetch_one(&db).await;
 
-    tracing::info!("Database connected");
+        tracing::info!(
+            "PostgreSQL version: {} (windmill require PG >= 14)",
+            num_version
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "UNKNOWN".to_string())
+        );
+        load_otel(&db).await;
 
-    let environment = load_base_url(&db)
+        tracing::info!("Database connected");
+        Connection::Sql(db)
+    };
+
+    let environment = load_base_url(&conn)
         .await
         .unwrap_or_else(|_| "local".to_string())
         .trim_start_matches("https://")
@@ -387,23 +395,30 @@ async fn windmill_main() -> anyhow::Result<()> {
         .ok()
         .is_some_and(|x| x == "1" || x == "true");
 
-    if !is_agent && !indexer_mode {
-        let skip_migration = std::env::var("SKIP_MIGRATION")
-            .map(|val| val == "true")
-            .unwrap_or(false);
+    if let Some(db) = conn.as_sql() {
+        if !is_agent && !indexer_mode {
+            let skip_migration = std::env::var("SKIP_MIGRATION")
+                .map(|val| val == "true")
+                .unwrap_or(false);
 
-        if !skip_migration {
-            // migration code to avoid break
-            migration_handle = windmill_api::migrate_db(&db).await?;
-        } else {
-            tracing::info!("SKIP_MIGRATION set, skipping db migration...")
+            if !skip_migration {
+                // migration code to avoid break
+                migration_handle = windmill_api::migrate_db(&db).await?;
+            } else {
+                tracing::info!("SKIP_MIGRATION set, skipping db migration...")
+            }
         }
     }
 
-    drop(db);
+    drop(conn);
     let worker_mode = num_workers > 0;
 
-    let db = windmill_common::connect_db(server_mode, indexer_mode, worker_mode).await?;
+    let conn = if mode == Mode::Agent {
+        Connection::Http
+    } else {
+        let db = windmill_common::connect_db(server_mode, indexer_mode, worker_mode).await?;
+        Connection::Sql(db)
+    };
 
     let (killpill_tx, mut killpill_rx) = KillpillSender::new(2);
     let mut monitor_killpill_rx = killpill_tx.subscribe();
@@ -431,12 +446,14 @@ Windmill Community Edition {GIT_VERSION}
 
     display_config(&ENV_SETTINGS);
 
-    if let Err(e) = reload_base_url_setting(&db).await {
+    if let Err(e) = reload_base_url_setting(&conn).await {
         tracing::error!("Error loading base url: {:?}", e)
     }
 
-    if let Err(e) = reload_critical_error_channels_setting(&db).await {
-        tracing::error!("Could loading critical error emails setting: {:?}", e);
+    if let Some(db) = conn.as_sql() {
+        if let Err(e) = reload_critical_error_channels_setting(&db).await {
+            tracing::error!("Could loading critical error emails setting: {:?}", e);
+        }
     }
 
     #[cfg(feature = "enterprise")]
@@ -445,7 +462,7 @@ Windmill Community Edition {GIT_VERSION}
         // if not valid and not server mode just quit
         // if not expired and server mode then force renewal
         // if key still invalid and num_workers > 0, set to 0
-        if let Err(err) = reload_license_key(&db).await {
+        if let Err(err) = reload_license_key(&conn).await {
             tracing::error!("Failed to reload license key: {err:#}");
         }
         let valid_key = *LICENSE_KEY_VALID.read().await;
@@ -453,17 +470,21 @@ Windmill Community Edition {GIT_VERSION}
             tracing::error!("Invalid license key, workers require a valid license key");
         }
         if server_mode {
-            // only force renewal if invalid but not empty (= expired)
-            let renewed_now = maybe_renew_license_key_on_start(
-                &HTTP_CLIENT,
-                &db,
-                !valid_key && !LICENSE_KEY_ID.read().await.is_empty(),
-            )
-            .await;
-            if renewed_now {
-                if let Err(err) = reload_license_key(&db).await {
-                    tracing::error!("Failed to reload license key: {err:#}");
+            if let Some(db) = conn.as_sql() {
+                // only force renewal if invalid but not empty (= expired)
+                let renewed_now = maybe_renew_license_key_on_start(
+                    &HTTP_CLIENT,
+                    &db,
+                    !valid_key && !LICENSE_KEY_ID.read().await.is_empty(),
+                )
+                .await;
+                if renewed_now {
+                    if let Err(err) = reload_license_key(&conn).await {
+                        tracing::error!("Failed to reload license key: {err:#}");
+                    }
                 }
+            } else {
+                panic!("Server mode requires a database connection");
             }
         }
     }
@@ -491,7 +512,7 @@ Windmill Community Edition {GIT_VERSION}
         };
 
         initial_load(
-            &db,
+            &conn,
             killpill_tx.clone(),
             worker_mode,
             server_mode,
@@ -501,7 +522,7 @@ Windmill Community Edition {GIT_VERSION}
         .await;
 
         monitor_db(
-            &db,
+            &conn,
             &base_internal_url,
             server_mode,
             worker_mode,
@@ -511,7 +532,9 @@ Windmill Community Edition {GIT_VERSION}
         .await;
 
         #[cfg(feature = "prometheus")]
-        crate::monitor::monitor_pool(&db).await;
+        if let Some(db) = conn.as_sql() {
+            crate::monitor::monitor_pool(&db).await;
+        }
 
         send_logs_to_object_store(&db, &hostname, &mode);
 
@@ -653,7 +676,7 @@ Windmill Community Edition {GIT_VERSION}
                 let base_internal_url = base_internal_rx.await?;
                 if worker_mode {
                     run_workers(
-                        ConnectionMode::Sql(db.clone()),
+                        conn.clone(),
                         rx,
                         killpill_tx.clone(),
                         num_workers,
@@ -738,6 +761,11 @@ Windmill Community Edition {GIT_VERSION}
                                             let workspace_id = n.payload();
                                             tracing::info!("Workspace envs change detected, invalidating workspace envs cache: {}", workspace_id);
                                             windmill_common::variables::CUSTOM_ENVS_CACHE.remove(workspace_id);
+                                        },
+                                        "notify_workspace_premium_change" => {
+                                            let workspace_id = n.payload();
+                                            tracing::info!("Workspace premium change detected, invalidating workspace premium cache: {}", workspace_id);
+                                            windmill_common::workspaces::IS_PREMIUM_CACHE.remove(workspace_id);
                                         },
                                         "notify_global_setting_change" => {
                                             tracing::info!("Global setting change detected: {}", n.payload());
@@ -1012,15 +1040,17 @@ async fn listen_pg(url: &str) -> Option<PgListener> {
         }
     };
 
-    if let Err(e) = listener
-        .listen_all(vec![
-            "notify_config_change",
-            "notify_global_setting_change",
-            "notify_webhook_change",
-            "notify_workspace_envs_change",
-        ])
-        .await
-    {
+    #[allow(unused_mut)]
+    let mut channels = vec![
+        "notify_config_change",
+        "notify_global_setting_change",
+        "notify_webhook_change",
+        "notify_workspace_envs_change",
+    ];
+    #[cfg(feature = "cloud")]
+    channels.push("notify_workspace_premium_change");
+
+    if let Err(e) = listener.listen_all(channels).await {
         tracing::error!(error = %e, "Could not listen to database");
         return None;
     }
@@ -1060,7 +1090,7 @@ fn display_config(envs: &[&str]) {
 }
 
 pub async fn run_workers(
-    db: ConnectionMode,
+    db: Connection,
     mut rx: tokio::sync::broadcast::Receiver<()>,
     tx: KillpillSender,
     num_workers: i32,

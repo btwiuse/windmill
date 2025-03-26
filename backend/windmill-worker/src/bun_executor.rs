@@ -676,21 +676,15 @@ pub async fn prebundle_bun_script(
     script_path: &str,
     job_id: &Uuid,
     w_id: &str,
-    db: Option<&Connection>,
+    db: Option<&DB>,
     job_dir: &str,
     base_internal_url: &str,
     worker_name: &str,
     token: &str,
     occupancy_metrics: &mut Option<&mut OccupancyMetrics>,
 ) -> Result<()> {
-    let (local_path, remote_path) = compute_bundle_local_and_remote_path(
-        inner_content,
-        lockfile,
-        script_path,
-        db.clone(),
-        w_id,
-    )
-    .await;
+    let (local_path, remote_path) =
+        compute_bundle_local_and_remote_path(inner_content, lockfile, script_path, db, w_id).await;
     if exists_in_cache(&local_path, &remote_path).await {
         return Ok(());
     }
@@ -724,7 +718,7 @@ pub async fn prebundle_bun_script(
         w_id,
         job_id,
         worker_name,
-        db.clone(),
+        db.map(|x| x.into()),
         None,
         &mut 0,
         &mut None,
@@ -756,7 +750,7 @@ async fn compute_bundle_local_and_remote_path(
     inner_content: &str,
     requirements_o: Option<&String>,
     script_path: &str,
-    db: Option<&Connection>,
+    db: Option<&DB>,
     w_id: &str,
 ) -> (String, String) {
     let mut input_src = format!(
@@ -824,7 +818,7 @@ pub async fn handle_bun_job(
     mem_peak: &mut i32,
     canceled_by: &mut Option<CanceledBy>,
     job: &MiniPulledJob,
-    db: &sqlx::Pool<sqlx::Postgres>,
+    conn: &Connection,
     client: &AuthedClient,
     parent_runnable_path: Option<String>,
     job_dir: &str,
@@ -843,14 +837,21 @@ pub async fn handle_bun_job(
         && !*DISABLE_BUNDLING
         && codebase.is_none()
     {
-        let (local_path, remote_path) = compute_bundle_local_and_remote_path(
-            inner_content,
-            requirements_o,
-            job.runnable_path(),
-            Some(db.clone()),
-            &job.workspace_id,
-        )
-        .await;
+        let (local_path, remote_path) = match conn {
+            Connection::Sql(db) => {
+                compute_bundle_local_and_remote_path(
+                    inner_content,
+                    requirements_o,
+                    job.runnable_path(),
+                    Some(db),
+                    &job.workspace_id,
+                )
+                .await
+            }
+            Connection::Http => {
+                todo!()
+            }
+        };
 
         let (cache, logs) = windmill_common::worker::load_cache(&local_path, &remote_path).await;
         (cache, logs, local_path, remote_path)
@@ -916,7 +917,7 @@ pub async fn handle_bun_job(
                 canceled_by,
                 &job.id,
                 &job.workspace_id,
-                Some(db),
+                Some(conn),
                 job_dir,
                 worker_name,
                 common_bun_proc_envs.clone(),
@@ -928,13 +929,13 @@ pub async fn handle_bun_job(
     } else {
         // if !*DISABLE_NSJAIL || !empty_trusted_deps || has_custom_config_registry {
         let logs1 = "\n\n--- BUN INSTALL ---\n".to_string();
-        append_logs(&job.id, &job.workspace_id, logs1, db).await;
+        append_logs(&job.id, &job.workspace_id, logs1, conn).await;
         let _ = gen_bun_lockfile(
             mem_peak,
             canceled_by,
             &job.id,
             &job.workspace_id,
-            Some(db),
+            Some(conn),
             &client.token,
             job.runnable_path(),
             job_dir,
@@ -1104,12 +1105,13 @@ try {{
     let reserved_variables_args_out_f = async {
         let args_and_out_f = async {
             if !annotation.native {
-                create_args_and_out_file(&client, job, job_dir, db).await?;
+                create_args_and_out_file(&client, job, job_dir, conn).await?;
             }
             Ok(()) as Result<()>
         };
         let reserved_variables_f = async {
-            let vars = get_reserved_variables(job, &client.token, db, parent_runnable_path).await?;
+            let vars =
+                get_reserved_variables(job, &client.token, conn, parent_runnable_path).await?;
             Ok(vars) as Result<HashMap<String, String>>
         };
         let (_, reserved_variables) = tokio::try_join!(args_and_out_f, reserved_variables_f)?;
@@ -1172,7 +1174,7 @@ try {{
                 &job.workspace_id,
                 &job.id,
                 worker_name,
-                Some(db.clone()),
+                Some(conn),
                 job.timeout,
                 mem_peak,
                 canceled_by,
@@ -1214,7 +1216,7 @@ try {{
                 &job.workspace_id,
                 &job.id,
                 worker_name,
-                db,
+                conn,
                 job.timeout,
                 mem_peak,
                 canceled_by,
@@ -1244,7 +1246,7 @@ try {{
                 .join("\n"));
             let js_code = read_file_content(&format!("{job_dir}/main.js")).await?;
             let started_at = Instant::now();
-            let args = crate::common::build_args_map(job, client, db)
+            let args = crate::common::build_args_map(job, client, conn)
                 .await?
                 .map(sqlx::types::Json);
             let job_args = if args.is_some() {
@@ -1253,7 +1255,7 @@ try {{
                 job.args.as_ref()
             };
 
-            append_logs(&job.id, &job.workspace_id, format!("{init_logs}\n"), db).await;
+            append_logs(&job.id, &job.workspace_id, format!("{init_logs}\n"), conn).await;
 
             let result = crate::js_eval::eval_fetch_timeout(
                 env_code,
@@ -1262,7 +1264,7 @@ try {{
                 job_args,
                 job.id,
                 job.timeout,
-                db,
+                conn,
                 mem_peak,
                 canceled_by,
                 worker_name,
@@ -1278,7 +1280,7 @@ try {{
             return Ok(result);
         }
     }
-    append_logs(&job.id, &job.workspace_id, init_logs, db).await;
+    append_logs(&job.id, &job.workspace_id, init_logs, conn).await;
 
     //do not cache local dependencies
     let child = if !*DISABLE_NSJAIL {
@@ -1410,7 +1412,7 @@ try {{
 
     handle_child(
         &job.id,
-        db,
+        conn,
         mem_peak,
         canceled_by,
         child,
@@ -1519,7 +1521,7 @@ pub async fn start_worker(
     annotation.nodejs = true;
 
     let context = variables::get_reserved_variables(
-        db,
+        db.into(),
         w_id,
         &token,
         "dedicated_worker@windmill.dev",
@@ -1570,7 +1572,7 @@ pub async fn start_worker(
                 &mut canceled_by,
                 &Uuid::nil(),
                 &w_id,
-                Some(db),
+                Some(db.into()),
                 job_dir,
                 worker_name,
                 common_bun_proc_envs.clone(),
@@ -1587,7 +1589,7 @@ pub async fn start_worker(
             &mut canceled_by,
             &Uuid::nil(),
             &w_id,
-            Some(db),
+            Some(db.into()),
             token,
             &script_path,
             job_dir,
@@ -1688,7 +1690,7 @@ for await (const line of Readline.createInterface({{ input: process.stdin }})) {
             w_id,
             &Uuid::nil(),
             worker_name,
-            db,
+            db.into(),
             None,
             &mut mem_peak,
             &mut canceled_by,

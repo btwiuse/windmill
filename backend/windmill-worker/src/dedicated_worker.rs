@@ -187,7 +187,7 @@ pub async fn handle_dedicated_process(
                         match serde_json::from_str::<Box<serde_json::value::RawValue>>(&line.replace("wm_res[success]:", "").replace("wm_res[error]:", "")) {
                             Ok(result) => {
                                 let result = Arc::new(result);
-                                append_logs(&job.id, &job.workspace_id,  logs.clone(), db).await;
+                                append_logs(&job.id, &job.workspace_id,  logs.clone(), &db.into()).await;
                                 if line.starts_with("wm_res[success]:") {
                                     job_completed_tx.send(JobCompleted { job , result, result_columns: None, mem_peak: 0, canceled_by: None, success: true, cached_res_path: None, token: token.to_string(), duration: None }).await.unwrap()
                                 } else {
@@ -586,7 +586,7 @@ async fn spawn_dedicated_worker(
             std::sync::Arc<MiniPulledJob>,
         >(MAX_BUFFERED_DEDICATED_JOBS);
         let killpill_rx = killpill_rx.resubscribe();
-        let db = db.clone();
+        let db2 = db.clone();
         let base_internal_url = base_internal_url.to_string();
         let worker_name = worker_name.to_string();
         let job_completed_tx = job_completed_tx.clone();
@@ -613,11 +613,11 @@ async fn spawn_dedicated_worker(
         let (content, lock, language, envs, codebase) = match sw.clone() {
             SpawnWorker::Script { path, hash } => {
                 let q = if let Some(hash) = hash {
-                    get_script_content_by_hash(&hash, &w_id, &db).await.map(
-                        |r: ContentReqLangEnvs| {
+                    get_script_content_by_hash(&hash, &w_id, &db2.into())
+                        .await
+                        .map(|r: ContentReqLangEnvs| {
                             Some((r.content, r.lockfile, r.language, r.envs, r.codebase))
-                        },
-                    )
+                        })
                 } else {
                     sqlx::query_as::<_, (String, Option<String>, Option<ScriptLang>, Option<Vec<String>>, bool, Option<ScriptHash>)>(
                         "SELECT content, lock, language, envs, codebase IS NOT NULL, hash FROM script WHERE path = $1 AND workspace_id = $2 AND
@@ -626,7 +626,7 @@ async fn spawn_dedicated_worker(
                     )
                     .bind(&path)
                     .bind(&w_id)
-                    .fetch_optional(&db)
+                    .fetch_optional(&db2)
                     .await
                     .map_err(|e| Error::internal_err(format!("expected content and lock: {e:#}")))
                     .map(|x| x.map(|y| (y.0, y.1, y.2, y.3, if y.4 { y.5.map(|z| z.to_string()) } else { None })))
@@ -658,6 +658,7 @@ async fn spawn_dedicated_worker(
             _ => return None,
         }
 
+        let db = db.clone();
         let handle = tokio::spawn(async move {
             let token = if let Some(token) = JOB_TOKEN.as_ref() {
                 token.clone()

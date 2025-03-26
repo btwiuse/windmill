@@ -79,7 +79,7 @@ pub async fn update_script_dependency_map(
         )
         .await?;
         tx.commit().await?;
-        append_logs(job_id, w_id, logs, db).await;
+        append_logs(job_id, w_id, logs, &db.into()).await;
     }
     Ok(())
 }
@@ -177,7 +177,7 @@ fn try_normalize(path: &Path) -> Option<PathBuf> {
     Some(ret)
 }
 
-fn parse_bun_relative_imports(raw_code: &str, script_path: &str) -> error::Result<Vec<String>> {
+fn parse_ts_relative_imports(raw_code: &str, script_path: &str) -> error::Result<Vec<String>> {
     let mut relative_imports = vec![];
     let r = parse_expr_for_imports(raw_code)?;
     for import in r {
@@ -209,8 +209,8 @@ pub fn extract_relative_imports(
     match language {
         #[cfg(feature = "python")]
         Some(ScriptLang::Python3) => parse_relative_imports(&raw_code, script_path).ok(),
-        Some(ScriptLang::Bun) | Some(ScriptLang::Bunnative) => {
-            parse_bun_relative_imports(&raw_code, script_path).ok()
+        Some(ScriptLang::Bun) | Some(ScriptLang::Bunnative) | Some(ScriptLang::Deno) => {
+            parse_ts_relative_imports(&raw_code, script_path).ok()
         }
         _ => None,
     }
@@ -222,7 +222,7 @@ pub async fn handle_dependency_job(
     mem_peak: &mut i32,
     canceled_by: &mut Option<CanceledBy>,
     job_dir: &str,
-    db: &sqlx::Pool<sqlx::Postgres>,
+    db: &DB,
     worker_name: &str,
     worker_dir: &str,
     base_internal_url: &str,
@@ -261,7 +261,7 @@ pub async fn handle_dependency_job(
     // - A saved script `hash` in the `script_hash` column.
     // - Preview raw lock and code in the `queue` or `job` table.
     let script_data = &match job.runnable_id {
-        Some(hash) => match cache::script::fetch(db, hash).await {
+        Some(hash) => match cache::script::fetch(db.into(), hash).await {
             Ok(d) => Cow::Owned(d.0),
             Err(e) => {
                 let logs2 = sqlx::query_scalar!(
@@ -281,7 +281,9 @@ pub async fn handle_dependency_job(
                 )
                 .execute(db)
                 .await?;
-                return Err(Error::ExecutionErr(format!("Error creating schema validator: {e}")))
+                return Err(Error::ExecutionErr(format!(
+                    "Error creating schema validator: {e}"
+                )));
             }
         },
         _ => match preview_data {
@@ -644,7 +646,7 @@ pub async fn handle_flow_dependency_job(
     tx = clear_dependency_parent_path(&parent_path, &job_path, &job.workspace_id, "flow", tx)
         .await?;
     sqlx::query!(
-        "DELETE FROM flow_workspace_runnables WHERE flow_path = $1 AND workspace_id = $2",
+        "DELETE FROM workspace_runnable_dependencies WHERE flow_path = $1 AND workspace_id = $2",
         job_path,
         job.workspace_id
     )
@@ -1013,7 +1015,7 @@ async fn lock_modules<'c>(
                 }
                 FlowModuleValue::Script { path, hash, .. } if !path.starts_with("hub/") => {
                     sqlx::query!(
-                        "INSERT INTO flow_workspace_runnables (flow_path, runnable_path, script_hash, runnable_is_flow, workspace_id) VALUES ($1, $2, $3, FALSE, $4) ON CONFLICT DO NOTHING",
+                        "INSERT INTO workspace_runnable_dependencies (flow_path, runnable_path, script_hash, runnable_is_flow, workspace_id) VALUES ($1, $2, $3, FALSE, $4) ON CONFLICT DO NOTHING",
                         job_path,
                         path,
                         hash.map(|h| h.0),
@@ -1024,10 +1026,10 @@ async fn lock_modules<'c>(
                 }
                 FlowModuleValue::Flow { path, .. } => {
                     sqlx::query!(
-                        "INSERT INTO flow_workspace_runnables (flow_path, runnable_path, runnable_is_flow, workspace_id) VALUES ($1, $2, TRUE, $3) ON CONFLICT DO NOTHING",
+                        "INSERT INTO workspace_runnable_dependencies (flow_path, runnable_path, runnable_is_flow, workspace_id) VALUES ($1, $2, TRUE, $3) ON CONFLICT DO NOTHING",
                         job_path,
                         path,
-                        job.workspace_id
+                        job.workspace_id,
                     )
                     .execute(&mut *tx)
                     .await?;
@@ -1109,7 +1111,7 @@ async fn lock_modules<'c>(
                         Some(e.id.clone()),
                     )
                     .await?;
-                    append_logs(&job.id, &job.workspace_id, logs, db).await;
+                    append_logs(&job.id, &job.workspace_id, logs, &db.into()).await;
                 }
 
                 if language == ScriptLang::Bun || language == ScriptLang::Bunnative {
@@ -1439,6 +1441,22 @@ async fn lock_modules_app(
 ) -> Result<Value> {
     match value {
         Value::Object(mut m) => {
+            if let (Some(Value::String(ref run_type)), Some(path), Some("runnableByPath")) = (
+                m.get("runType"),
+                m.get("path").and_then(|s| s.as_str()),
+                m.get("type").and_then(|s| s.as_str()),
+            ) {
+                // No script_hash because apps don't supports script version locks yet
+                sqlx::query!(
+                    "INSERT INTO workspace_runnable_dependencies (app_path, runnable_path, runnable_is_flow, workspace_id) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                    job_path,
+                    path,
+                    run_type == "flow",
+                    job.workspace_id
+                )
+                .execute(db)
+                .await?;
+            }
             if m.contains_key("inlineScript") {
                 let v = m.get_mut("inlineScript").unwrap();
                 if let Some(v) = v.as_object_mut() {
@@ -1485,7 +1503,7 @@ async fn lock_modules_app(
                             .await;
                             match new_lock {
                                 Ok(new_lock) => {
-                                    append_logs(&job.id, &job.workspace_id, logs, db).await;
+                                    append_logs(&job.id, &job.workspace_id, logs, &db.into()).await;
                                     let anns =
                                         windmill_common::worker::TypeScriptAnnotations::parse(
                                             &content,
@@ -1595,6 +1613,15 @@ pub async fn handle_app_dependency_job(
         .clone()
         .ok_or_else(|| Error::internal_err("App Dependency requires script hash".to_owned()))?
         .0;
+
+    sqlx::query!(
+        "DELETE FROM workspace_runnable_dependencies WHERE app_path = $1 AND workspace_id = $2",
+        job_path,
+        job.workspace_id
+    )
+    .execute(db)
+    .await?;
+
     let record = sqlx::query!("SELECT app_id, value FROM app_version WHERE id = $1", id)
         .fetch_optional(db)
         .await?
@@ -1724,7 +1751,7 @@ async fn python_dep(
 
     let final_version = annotated_pyv_numeric
         .and_then(|pyv| PyVersion::from_numeric(pyv))
-        .unwrap_or(PyVersion::from_instance_version(job_id, w_id, db).await);
+        .unwrap_or(PyVersion::from_instance_version(job_id, w_id, &db.into()).await);
 
     let req: std::result::Result<String, Error> = uv_pip_compile(
         job_id,
@@ -1732,7 +1759,7 @@ async fn python_dep(
         mem_peak,
         canceled_by,
         job_dir,
-        db,
+        &db.into(),
         worker_name,
         w_id,
         occupancy_metrics,
@@ -1748,7 +1775,7 @@ async fn python_dep(
             w_id,
             mem_peak,
             canceled_by,
-            db,
+            db.into(),
             worker_name,
             job_dir,
             worker_dir,
@@ -1881,7 +1908,7 @@ async fn capture_dependency_job(
                 mem_peak,
                 canceled_by,
                 job_dir,
-                db,
+                &db.into(),
                 false,
                 false,
                 false,
@@ -1903,7 +1930,7 @@ async fn capture_dependency_job(
                 mem_peak,
                 canceled_by,
                 job_dir,
-                Some(db),
+                Some(&db.into()),
                 w_id,
                 worker_name,
                 base_internal_url,
@@ -1923,7 +1950,7 @@ async fn capture_dependency_job(
                 canceled_by,
                 job_id,
                 w_id,
-                Some(db),
+                Some(&db.into()),
                 token,
                 script_path,
                 job_dir,
@@ -1946,7 +1973,7 @@ async fn capture_dependency_job(
                     script_path,
                     job_id,
                     w_id,
-                    Some(db.clone()),
+                    Some(&db),
                     &job_dir,
                     base_internal_url,
                     worker_name,

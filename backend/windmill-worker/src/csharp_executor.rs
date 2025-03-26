@@ -425,6 +425,7 @@ fn remove_lines_from_text(contents: &str, indices_to_remove: Vec<usize>) -> Stri
     result.join("\n")
 }
 
+use windmill_common::worker::Connection;
 use windmill_queue::MiniPulledJob;
 
 #[cfg(not(feature = "csharp"))]
@@ -432,7 +433,7 @@ pub async fn handle_csharp_job(
     _mem_peak: &mut i32,
     _canceled_by: &mut Option<CanceledBy>,
     _job: &MiniPulledJob,
-    _db: &sqlx::Pool<sqlx::Postgres>,
+    _conn: &Connection,
     _client: &AuthedClient,
     _parent_runnable_path: Option<String>,
     _inner_content: &str,
@@ -446,13 +447,12 @@ pub async fn handle_csharp_job(
 ) -> Result<Box<RawValue>, Error> {
     Err(anyhow!("C# is not available because the feature is not enabled").into())
 }
-
 #[cfg(feature = "csharp")]
 pub async fn handle_csharp_job(
     mem_peak: &mut i32,
     canceled_by: &mut Option<CanceledBy>,
     job: &MiniPulledJob,
-    db: &sqlx::Pool<sqlx::Postgres>,
+    conn: &Connection,
     client: &AuthedClient,
     parent_runnable_path: Option<String>,
     inner_content: &str,
@@ -491,7 +491,7 @@ pub async fn handle_csharp_job(
         cache_logs
     } else {
         let logs1 = format!("{cache_logs}\n\n--- DOTNET BUILD ---\n");
-        append_logs(&job.id, &job.workspace_id, logs1, db).await;
+        append_logs(&job.id, &job.workspace_id, logs1, conn).await;
 
         let (reqs, lines_to_remove) = parse_csharp_reqs(inner_content);
         for req in &reqs {
@@ -503,7 +503,7 @@ pub async fn handle_csharp_job(
                     req.0,
                     req.1.as_ref().unwrap_or(&"".to_string())
                 ),
-                db,
+                conn,
             )
             .await;
         }
@@ -521,7 +521,7 @@ pub async fn handle_csharp_job(
             mem_peak,
             canceled_by,
             job_dir,
-            db,
+            conn,
             worker_name,
             &job.workspace_id,
             base_internal_url,
@@ -531,13 +531,13 @@ pub async fn handle_csharp_job(
         .await?
     };
 
-    create_args_and_out_file(client, job, job_dir, db).await?;
+    create_args_and_out_file(client, job, job_dir, conn).await?;
 
     let logs2 = format!("{cache_logs}\n\n--- C# CODE EXECUTION ---\n");
-    append_logs(&job.id, &job.workspace_id, format!("{}\n", logs2), db).await;
+    append_logs(&job.id, &job.workspace_id, format!("{}\n", logs2), conn).await;
 
     let reserved_variables =
-        get_reserved_variables(job, &client.token, db, parent_runnable_path).await?;
+        get_reserved_variables(job, &client.token, conn, parent_runnable_path).await?;
 
     let child = if !*DISABLE_NSJAIL {
         write_file(
@@ -623,7 +623,7 @@ pub async fn handle_csharp_job(
 
     handle_child(
         &job.id,
-        db,
+        conn,
         mem_peak,
         canceled_by,
         child,

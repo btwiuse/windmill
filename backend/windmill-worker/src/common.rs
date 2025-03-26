@@ -72,10 +72,10 @@ pub fn check_executor_binary_exists(
 pub async fn build_args_values(
     job: &MiniPulledJob,
     client: &AuthedClient,
-    db: &Pool<Postgres>,
+    conn: &Connection,
 ) -> error::Result<HashMap<String, serde_json::Value>> {
     if let Some(args) = &job.args {
-        transform_json_as_values(client, &job.workspace_id, &args.0, job, db).await
+        transform_json_as_values(client, &job.workspace_id, &args.0, job, conn).await
     } else {
         Ok(HashMap::new())
     }
@@ -86,10 +86,10 @@ pub async fn create_args_and_out_file(
     client: &AuthedClient,
     job: &MiniPulledJob,
     job_dir: &str,
-    db: &Pool<Postgres>,
+    conn: &Connection,
 ) -> Result<(), Error> {
     if let Some(args) = job.args.as_ref() {
-        if let Some(x) = transform_json(client, &job.workspace_id, &args.0, job, db).await? {
+        if let Some(x) = transform_json(client, &job.workspace_id, &args.0, job, conn).await? {
             write_file(
                 job_dir,
                 "args.json",
@@ -127,7 +127,7 @@ pub async fn transform_json<'a>(
     workspace: &str,
     vs: &'a HashMap<String, Box<RawValue>>,
     job: &MiniPulledJob,
-    db: &Pool<Postgres>,
+    db: &Connection,
 ) -> error::Result<Option<HashMap<String, Box<RawValue>>>> {
     let mut has_match = false;
     for (_, v) in vs {
@@ -164,7 +164,7 @@ pub async fn transform_json_as_values<'a>(
     workspace: &str,
     vs: &'a HashMap<String, Box<RawValue>>,
     job: &MiniPulledJob,
-    db: &Pool<Postgres>,
+    db: &Connection,
 ) -> error::Result<HashMap<String, serde_json::Value>> {
     let mut r: HashMap<String, serde_json::Value> = HashMap::new();
     for (k, v) in vs {
@@ -232,7 +232,7 @@ pub async fn transform_json_value(
     workspace: &str,
     v: Value,
     job: &MiniPulledJob,
-    db: &Pool<Postgres>,
+    conn: &Connection,
 ) -> error::Result<Value> {
     match v {
         Value::String(y) if y.starts_with("$var:") => {
@@ -263,20 +263,32 @@ pub async fn transform_json_value(
                 })
         }
         Value::String(y) if y.starts_with("$encrypted:") => {
-            let encrypted = y.strip_prefix("$encrypted:").unwrap();
+            match conn {
+                Connection::Sql(db) => {
+                    let encrypted = y.strip_prefix("$encrypted:").unwrap();
 
-            let root_job_id =
-                get_root_job_id(&job.flow_innermost_root_job.unwrap_or_else(|| job.id), db).await?;
-            let mc = build_crypt_with_key_suffix(&db, &job.workspace_id, &root_job_id.to_string())
-                .await?;
-            decrypt(&mc, encrypted.to_string()).and_then(|x| {
-                serde_json::from_str(&x).map_err(|e| Error::internal_err(e.to_string()))
-            })
+                    let root_job_id =
+                        get_root_job_id(&job.flow_innermost_root_job.unwrap_or_else(|| job.id), db)
+                            .await?;
+                    let mc = build_crypt_with_key_suffix(
+                        &db,
+                        &job.workspace_id,
+                        &root_job_id.to_string(),
+                    )
+                    .await?;
+                    decrypt(&mc, encrypted.to_string()).and_then(|x| {
+                        serde_json::from_str(&x).map_err(|e| Error::internal_err(e.to_string()))
+                    })
+                }
+                Connection::Http => {
+                    Err(Error::NotFound("Http connection not supported".to_string()))
+                }
+            }
 
             // let path = y.strip_prefix("$res:").unwrap();
         }
         Value::String(y) if y.starts_with("$") => {
-            let variables = get_reserved_variables(job, &client.token, &db, None).await?;
+            let variables = get_reserved_variables(job, &client.token, conn, None).await?;
 
             let name = y.strip_prefix("$").unwrap();
 
@@ -291,7 +303,7 @@ pub async fn transform_json_value(
             for (a, b) in m.clone().into_iter() {
                 m.insert(
                     a.clone(),
-                    transform_json_value(&a, client, workspace, b, job, &db).await?,
+                    transform_json_value(&a, client, workspace, b, job, conn).await?,
                 );
             }
             Ok(Value::Object(m))
@@ -389,10 +401,15 @@ pub async fn get_reserved_variables(
     let flow_path = if parent_runnable_path.is_some() {
         parent_runnable_path
     } else if let Some(uuid) = job.parent_job {
-        sqlx::query_scalar!("SELECT runnable_path FROM v2_job WHERE id = $1", uuid)
-            .fetch_optional(db)
-            .await?
-            .flatten()
+        match db {
+            Connection::Sql(db) => {
+                sqlx::query_scalar!("SELECT runnable_path FROM v2_job WHERE id = $1", uuid)
+                    .fetch_optional(db)
+                    .await?
+                    .flatten()
+            }
+            Connection::Http => None,
+        }
     } else {
         None
     };
@@ -564,7 +581,7 @@ pub async fn start_child_process(mut cmd: Command, executable: &str) -> Result<C
 }
 
 pub async fn resolve_job_timeout(
-    _db: &Pool<Postgres>,
+    _conn: &Connection,
     _w_id: &str,
     _job_id: Uuid,
     custom_timeout_secs: Option<i32>,
@@ -572,13 +589,11 @@ pub async fn resolve_job_timeout(
     let mut warn_msg: Option<String> = None;
     #[cfg(feature = "cloud")]
     let cloud_premium_workspace = *CLOUD_HOSTED
-        && sqlx::query_scalar!("SELECT premium FROM workspace WHERE id = $1", _w_id)
-            .fetch_one(_db)
-            .await
-            .map_err(|e| {
-                tracing::error!(%e, "error getting premium workspace for job {_job_id}: {e:#}");
-            })
-            .unwrap_or(false);
+        && windmill_common::workspaces::is_premium_workspace(
+            _conn.as_sql().expect("cloud cannot use http connection"),
+            _w_id,
+        )
+        .await;
     #[cfg(not(feature = "cloud"))]
     let cloud_premium_workspace = false;
 

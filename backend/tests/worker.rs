@@ -315,7 +315,7 @@ mod suspend_resume {
                 let second = completed.next().await.unwrap();
                 // print_job(second, &db).await;
 
-                let token = windmill_worker::create_token_for_owner(&db, "test-workspace", "u/test-user", "", 100, "", &Uuid::nil(), None).await.unwrap();
+                let token = windmill_worker::create_token_for_owner(&db.into(), "test-workspace", "u/test-user", "", 100, "", &Uuid::nil(), None).await.unwrap();
                 let secret = reqwest::get(format!(
                     "http://localhost:{port}/api/w/test-workspace/jobs/job_signature/{second}/0?token={token}&approver=ruben"
                 ))
@@ -418,7 +418,7 @@ mod suspend_resume {
                 /* ... and send a request resume it. */
                 let second = completed.next().await.unwrap();
 
-                let token = windmill_worker::create_token_for_owner(&db, "test-workspace", "u/test-user", "", 100, "", &Uuid::nil(), None).await.unwrap();
+                let token = windmill_worker::create_token_for_owner(&db.into(), "test-workspace", "u/test-user", "", 100, "", &Uuid::nil(), None).await.unwrap();
                 let secret = reqwest::get(format!(
                     "http://localhost:{port}/api/w/test-workspace/jobs/job_signature/{second}/0?token={token}"
                 ))
@@ -1037,7 +1037,7 @@ fn spawn_test_worker(
             windmill_common::worker::make_pull_query(&wc).await;
         }
         windmill_worker::run_worker(
-            &db,
+            &db.into(),
             worker_instance,
             worker_name,
             1,
@@ -3799,7 +3799,7 @@ async fn test_result_format(db: Pool<Postgres>) {
     let port = server.addr.port();
 
     let token = windmill_worker::create_token_for_owner(
-        &db,
+        &db.clone().into(),
         "test-workspace",
         "u/test-user",
         "",
@@ -3839,7 +3839,7 @@ async fn test_result_format(db: Pool<Postgres>) {
     assert_eq!(job_result.get(), correct_result);
 
     let response = windmill_api::jobs::run_wait_result(
-        &db,
+        &db.into(),
         Uuid::parse_str(ordered_result_job_id).unwrap(),
         "test-workspace".to_string(),
         None,

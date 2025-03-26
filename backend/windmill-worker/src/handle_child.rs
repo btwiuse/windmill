@@ -94,7 +94,7 @@ async fn kill_process_tree(pid: Option<u32>) -> Result<(), String> {
 #[tracing::instrument(name="run_subprocess", level = "info", skip_all, fields(otel.name = %child_name))]
 pub async fn handle_child(
     job_id: &Uuid,
-    db: &Connection,
+    conn: &Connection,
     mem_peak: &mut i32,
     canceled_by_ref: &mut Option<CanceledBy>,
     mut child: Child,
@@ -138,7 +138,7 @@ pub async fn handle_child(
      * waiting for the child to exit normally */
     let update_job = update_job_poller(
         job_id,
-        db,
+        conn,
         mem_peak,
         canceled_by_ref,
         Box::pin(stream::unfold((), move |_| async move {
@@ -184,14 +184,14 @@ pub async fn handle_child(
     }
 
     let (timeout_duration, timeout_warn_msg, is_job_specific) =
-        resolve_job_timeout(&db, w_id, job_id, custom_timeout).await;
+        resolve_job_timeout(&conn, w_id, job_id, custom_timeout).await;
     if let Some(msg) = timeout_warn_msg {
-        append_logs(&job_id, w_id, msg.as_str(), db).await;
+        append_logs(&job_id, w_id, msg.as_str(), conn).await;
     }
 
     /* a future that completes when the child process exits */
     let wait_on_child = async {
-        let db = db.clone();
+        let db = conn.clone();
 
         let kill_reason = tokio::select! {
             biased;
@@ -208,18 +208,25 @@ pub async fn handle_child(
 
         let set_reason = async {
             if matches!(kill_reason, KillReason::Timeout { .. }) {
-                if let Err(err) = sqlx::query!(
-                    "UPDATE v2_job_queue
+                match conn {
+                    Connection::Sql(db) => {
+                        if let Err(err) = sqlx::query!(
+                            "UPDATE v2_job_queue
                         SET canceled_by = 'timeout'
                           , canceled_reason = $1
                     WHERE id = $2",
-                    format!("duration > {}", timeout_duration.as_secs()),
-                    job_id
-                )
-                .execute(&db)
-                .await
-                {
-                    tracing::error!(%job_id, %err, "error setting cancelation reason for job {job_id}: {err}");
+                            format!("duration > {}", timeout_duration.as_secs()),
+                            job_id
+                        )
+                        .execute(db)
+                        .await
+                        {
+                            tracing::error!(%job_id, %err, "error setting cancelation reason for job {job_id}: {err}");
+                        }
+                    }
+                    Connection::Http => {
+                        todo!()
+                    }
                 }
             }
         };
@@ -387,7 +394,7 @@ pub async fn handle_child(
 
             let worker_name = worker.to_string();
             let w_id2 = w_id.to_string();
-            (do_write, write_result) = tokio::spawn(append_job_logs(job_id, w_id2, joined, db.clone(), compact_logs, pg_log_total_size.clone(), worker_name)).remote_handle();
+            (do_write, write_result) = tokio::spawn(append_job_logs(job_id, w_id2, joined, conn.clone(), compact_logs, pg_log_total_size.clone(), worker_name)).remote_handle();
 
 
 
@@ -591,9 +598,11 @@ where
                     tracing::info!("job {job_id} on {worker_name} in {w_id} worker memory snapshot {}kB/{}kB", memory_usage.unwrap_or_default()/1024, wm_memory_usage.unwrap_or_default()/1024);
                     let occupancy = occupancy_metrics.as_mut().map(|x| x.update_occupancy_metrics());
                     if job_id != Uuid::nil() {
-                        sqlx::query!(
-                            "UPDATE worker_ping SET ping_at = now(), current_job_id = $1, current_job_workspace_id = $2, memory_usage = $3, wm_memory_usage = $4,
-                            occupancy_rate = $6, occupancy_rate_15s = $7, occupancy_rate_5m = $8, occupancy_rate_30m = $9 WHERE worker = $5",
+                        match conn.clone() {
+                            Connection::Sql(ref db) => {
+                                sqlx::query!(
+                        "UPDATE worker_ping SET ping_at = now(), current_job_id = $1, current_job_workspace_id = $2, memory_usage = $3, wm_memory_usage = $4,
+                        occupancy_rate = $6, occupancy_rate_15s = $7, occupancy_rate_5m = $8, occupancy_rate_30m = $9 WHERE worker = $5",
                             &job_id,
                             &w_id,
                             memory_usage,
@@ -604,9 +613,14 @@ where
                             occupancy.and_then(|x| x.2),
                             occupancy.and_then(|x| x.3),
                         )
-                        .execute(&db)
+                        .execute(db)
                         .await
                         .expect("update worker ping");
+                            }
+                            Connection::Http => {
+                                todo!()
+                            }
+                        }
                     }
                 }
                 let current_mem = get_mem.next().await.unwrap_or(0);
@@ -622,9 +636,11 @@ where
                 {
                     if job_id != Uuid::nil() {
 
-                        // tracking metric starting at i >= 2 b/c first point it useless and we don't want to track metric for super fast jobs
-                        if i == 2 {
-                            memory_metric_id = job_metrics::register_metric_for_job(
+                        match conn {
+                            Connection::Sql(ref db) => {
+                                // tracking metric starting at i >= 2 b/c first point it useless and we don't want to track metric for super fast jobs
+                                if i == 2 {
+                                    memory_metric_id = job_metrics::register_metric_for_job(
                                 &db,
                                 w_id.to_string(),
                                 job_id,
@@ -637,13 +653,20 @@ where
                         if let Ok(ref metric_id) = memory_metric_id {
                             if let Err(err) = job_metrics::record_metric(&db, w_id.to_string(), job_id, metric_id.to_owned(), job_metrics::MetricNumericValue::Integer(current_mem)).await {
                                 tracing::error!("Unable to save memory stat for job {} in workspace {}. Error was: {:?}", job_id, w_id, err);
+                                }
+                            }
+                            },
+                            Connection::Http => {
+                                todo!()
                             }
                         }
                     }
                 }
                 if job_id != Uuid::nil() {
-                    let (canceled_by, canceled_reason, already_completed) = sqlx::query!(
-                            "UPDATE v2_job_runtime r SET
+                    let (canceled_by, canceled_reason, already_completed) = match conn {
+                        Connection::Sql(ref db) => {
+                            sqlx::query!(
+                                "UPDATE v2_job_runtime r SET
                                 memory_peak = $1,
                                 ping = now()
                             FROM v2_job_queue q
@@ -652,17 +675,22 @@ where
                             *mem_peak,
                             job_id
                         )
-                        .map(|x| (x.canceled_by, x.canceled_reason, false))
-                        .fetch_optional(&db)
-                        .await
-                        .unwrap_or_else(|e| {
-                            tracing::error!(%e, "error updating job {job_id}: {e:#}");
-                            Some((None, None, false))
-                        })
-                        .unwrap_or_else(|| {
-                            // if the job is not in queue, it can only be in the completed_job so it is already complete
-                            (None, None, true)
-                        });
+                            .map(|x| (x.canceled_by, x.canceled_reason, false))
+                            .fetch_optional(db)
+                            .await
+                            .unwrap_or_else(|e| {
+                                tracing::error!(%e, "error updating job {job_id}: {e:#}");
+                                Some((None, None, false))
+                            })
+                            .unwrap_or_else(|| {
+                                // if the job is not in queue, it can only be in the completed_job so it is already complete
+                                (None, None, true)
+                            })
+                        }
+                        Connection::Http => {
+                            todo!()
+                        }
+                    };
                     if already_completed {
                         return UpdateJobPollingExit::AlreadyCompleted
                     }

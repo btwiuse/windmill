@@ -26,7 +26,7 @@ use tower::ServiceBuilder;
 use windmill_common::error::JsonResult;
 use windmill_common::flow_status::{JobResult, RestartedFrom};
 use windmill_common::jobs::{format_completed_job_result, format_result, ENTRYPOINT_OVERRIDE};
-use windmill_common::worker::{Connection, CLOUD_HOSTED, TMP_DIR};
+use windmill_common::worker::{CLOUD_HOSTED, TMP_DIR};
 
 use windmill_common::scripts::PREVIEW_IS_CODEBASE_HASH;
 use windmill_common::variables::get_workspace_key;
@@ -928,7 +928,7 @@ impl<'a> GetQuery<'a> {
             // Try to fetch the code from the cache, fallback to the preview code.
             // NOTE: This could check for the job kinds instead of the `or_else` but it's not
             // necessary as `fetch_script` return early if the job kind is not a preview one.
-            cache::job::fetch_script(db, kind, hash)
+            cache::job::fetch_script(db.clone(), kind, hash)
                 .or_else(|_| cache::job::fetch_preview_script(db.into(), &id, raw_lock, raw_code))
                 .await
                 .ok()

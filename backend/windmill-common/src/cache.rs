@@ -502,6 +502,8 @@ pub mod flow {
 }
 
 pub mod script {
+    use crate::{worker::Connection, DB};
+
     use super::*;
 
     make_static! {
@@ -520,64 +522,78 @@ pub mod script {
     /// it to the file system and cache.
     /// This should be preferred over fetching the database directly.
     #[track_caller]
-    pub fn fetch<'c>(
-        e: impl PgExecutor<'c>,
+    pub fn fetch(
+        conn: &Connection,
         hash: ScriptHash,
     ) -> impl Future<Output = error::Result<(Arc<ScriptData>, Arc<ScriptMetadata>)>> {
         // If not present, `get_or_insert_async` will lock the key until the future completes,
         // so only one thread will be able to fetch the data from the database and write it to
         // the file system and cache, hence no race on the file system.
         let loc = Location::caller();
+        let conn = conn.clone();
         let fut = CACHE.get_or_insert_async(hash, async move {
-            sqlx::query!(
-                "SELECT \
-                    content AS \"content!: String\",
-                    lock AS \"lock: String\", \
-                    language AS \"language: Option<ScriptLang>\", \
-                    envs AS \"envs: Vec<String>\", \
-                    schema AS \"schema: String\", \
-                    schema_validation AS \"schema_validation: bool\", \
-                    codebase LIKE '%.tar' as use_tar \
-                FROM script WHERE hash = $1 LIMIT 1",
-                hash.0
-            )
-            .fetch_optional(e)
-            .await
-            .map_err(Into::into)
-            .and_then(unwrap_or_error(&loc, "Script", hash))
-            .and_then(|r| {
-                Ok(RawScript {
-                    content: r.content,
-                    lock: r.lock,
-                    meta: Some(ScriptMetadata {
-                        language: r.language,
-                        envs: r.envs,
-                        codebase: if let Some(use_tar) = r.use_tar {
-                            let sh = hash.to_string();
-                            if use_tar {
-                                Some(format!("{sh}.tar"))
-                            } else {
-                                Some(sh)
-                            }
-                        } else {
-                            None
-                        },
-                        schema_validator: if r.schema_validation {
-                            r.schema
-                                .as_ref()
-                                .map(|schema_str| {
-                                    SchemaValidator::from_schema(schema_str).map_err(|e| anyhow!("Couldn't create schema validator for script requiring schema validation: {e}"))
-                                })
-                                .transpose()?
-                        } else {
-                            None
-                        },
-                        schema: r.schema,
-                    }),
-                })
-            })
+            match conn {
+                Connection::Sql(db) => fetch_script_from_db(&db, hash, loc).await,
+                Connection::Http => Err(error::Error::InternalErr(format!(
+                    "Cannot fetch script in HTTP mode"
+                ))),
+            }
         });
         fut.map_ok(|ScriptFull { data, meta }| (data, meta))
+    }
+
+    async fn fetch_script_from_db(
+        db: &DB,
+        hash: ScriptHash,
+        loc: &'static Location<'_>,
+    ) -> error::Result<RawScript> {
+        sqlx::query!(
+                "SELECT \
+                content AS \"content!: String\",
+                lock AS \"lock: String\", \
+                language AS \"language: Option<ScriptLang>\", \
+                envs AS \"envs: Vec<String>\", \
+                schema AS \"schema: String\", \
+                schema_validation AS \"schema_validation: bool\", \
+                codebase LIKE '%.tar' as use_tar \
+            FROM script WHERE hash = $1 LIMIT 1",
+            hash.0
+        )
+        .fetch_optional(db)
+        .await
+        .map_err(Into::into)
+        .and_then(unwrap_or_error(&loc, "Script", hash))
+        .and_then(|r| {
+            Ok(RawScript {
+                content: r.content,
+                lock: r.lock,
+                meta: Some(ScriptMetadata {
+                    language: r.language,
+                    envs: r.envs,
+                    codebase: if let Some(use_tar) = r.use_tar {
+                        let sh = hash.to_string();
+                        if use_tar {
+                            Some(format!("{sh}.tar"))
+                        } else {
+                            Some(sh)
+                        }
+                    } else {
+                        None
+                    },
+                    schema_validator: if r.schema_validation {
+                        r.schema
+                            .as_ref()
+                            .map(|schema_str| {
+                                SchemaValidator::from_schema(schema_str).map_err(|e| anyhow!("Couldn't create schema validator for script requiring schema validation: {e}"))
+                            })
+                            .transpose()?
+                    } else {
+                        None
+                    },
+                    schema: r.schema,
+                }),
+            })
+        })
     }
 
     /// Invalidate the script cache for the given `hash`.
@@ -735,8 +751,8 @@ pub mod job {
     }
 
     #[track_caller]
-    pub fn fetch_script<'c>(
-        e: impl PgExecutor<'c>,
+    pub fn fetch_script(
+        db: DB,
         kind: JobKind,
         hash: Option<ScriptHash>,
     ) -> impl Future<Output = error::Result<Arc<ScriptData>>> {
@@ -744,11 +760,11 @@ pub mod job {
         let loc = Location::caller();
         async move {
             match (kind, hash.map(|ScriptHash(id)| id)) {
-                (FlowScript, Some(id)) => flow::fetch_script(e, FlowNodeId(id)).await,
-                (Script | Dependencies, Some(hash)) => script::fetch(e, ScriptHash(hash))
+                (FlowScript, Some(id)) => flow::fetch_script(&db, FlowNodeId(id)).await,
+                (Script | Dependencies, Some(hash)) => script::fetch(&db.into(), ScriptHash(hash))
                     .await
                     .map(|(data, _meta)| data),
-                (AppScript, Some(id)) => app::fetch_script(e, AppScriptId(id)).await,
+                (AppScript, Some(id)) => app::fetch_script(&db, AppScriptId(id)).await,
                 _ => Err(error::Error::internal_err(format!(
                     "Isn't a script job: {:?}",
                     kind

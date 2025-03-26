@@ -185,7 +185,7 @@ pub(crate) async fn pull_same_worker_job(
             )
             .execute(db)
             .await;
-            Ok(r)
+            r
         }
         Connection::Http => {
             todo!()

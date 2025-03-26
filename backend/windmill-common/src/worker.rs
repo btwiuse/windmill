@@ -120,6 +120,15 @@ pub enum Connection {
     Http,
 }
 
+impl Connection {
+    pub fn as_sql(&self) -> Option<&Pool<Postgres>> {
+        match self {
+            Connection::Sql(db) => Some(db),
+            Connection::Http => None,
+        }
+    }
+}
+
 impl From<Pool<Postgres>> for Connection {
     fn from(value: Pool<Postgres>) -> Self {
         Connection::Sql(value)
@@ -688,24 +697,33 @@ pub fn get_windmill_memory_usage() -> Option<i64> {
     }
 }
 
-pub async fn update_min_version<'c, E: sqlx::Executor<'c, Database = sqlx::Postgres>>(
-    executor: E,
-) -> bool {
+pub async fn update_min_version(conn: &Connection) -> bool {
     use crate::utils::{GIT_SEM_VERSION, GIT_VERSION};
 
-    // fetch all pings with a different version than self from the last 5 minutes.
-    let pings = sqlx::query_scalar!(
-        "SELECT wm_version FROM worker_ping WHERE wm_version != $1 AND ping_at > now() - interval '5 minutes'",
-        GIT_VERSION
-    ).fetch_all(executor).await.unwrap_or_default();
-
     let cur_version = GIT_SEM_VERSION.clone();
-    let min_version = pings
-        .iter()
-        .filter(|x| !x.is_empty())
-        .filter_map(|x| semver::Version::parse(if x.starts_with('v') { &x[1..] } else { x }).ok())
-        .min()
-        .unwrap_or_else(|| cur_version.clone());
+
+    let min_version = match conn {
+        Connection::Sql(pool) => {
+            // fetch all pings with a different version than self from the last 5 minutes.
+            let pings = sqlx::query_scalar!(
+                "SELECT wm_version FROM worker_ping WHERE wm_version != $1 AND ping_at > now() - interval '5 minutes'",
+                GIT_VERSION
+            ).fetch_all(pool).await.unwrap_or_default();
+
+            pings
+                .iter()
+                .filter(|x| !x.is_empty())
+                .filter_map(|x| {
+                    semver::Version::parse(if x.starts_with('v') { &x[1..] } else { x }).ok()
+                })
+                .min()
+                .unwrap_or_else(|| cur_version.clone())
+        }
+        Connection::Http => {
+            // TODO: get min version from server, for now we use the current version. Min version should be of no interest for http mode workers
+            cur_version.clone()
+        }
+    };
 
     if min_version != cur_version {
         tracing::info!("Minimal worker version: {min_version}");
