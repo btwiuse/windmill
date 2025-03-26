@@ -536,7 +536,7 @@ Windmill Community Edition {GIT_VERSION}
             crate::monitor::monitor_pool(&db).await;
         }
 
-        send_logs_to_object_store(&db, &hostname, &mode);
+        send_logs_to_object_store(&conn, &hostname, &mode);
 
         #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
         if !worker_mode {

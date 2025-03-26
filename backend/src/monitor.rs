@@ -490,8 +490,8 @@ fn get_worker_group(mode: &Mode) -> Option<String> {
     }
 }
 
-pub fn send_logs_to_object_store(db: &DB, hostname: &str, mode: &Mode) {
-    let db = db.clone();
+pub fn send_logs_to_object_store(conn: &DB, hostname: &str, mode: &Mode) {
+    let conn = conn.clone();
     let hostname = hostname.to_string();
     let mode = mode.clone();
     let worker_group = get_worker_group(&mode);
@@ -506,7 +506,7 @@ pub fn send_logs_to_object_store(db: &DB, hostname: &str, mode: &Mode) {
                 &hostname,
                 &mode,
                 &worker_group,
-                &db,
+                &conn,
                 snd_highest_file,
                 false,
             )
@@ -535,7 +535,7 @@ async fn send_log_file_to_object_store(
     hostname: &str,
     mode: &Mode,
     worker_group: &Option<String>,
-    db: &Pool<Postgres>,
+    db: &Pool<Postgres,
     snd_highest_file: Option<String>,
     use_now: bool,
 ) {
