@@ -7,7 +7,6 @@
  */
 
 use anyhow::Context;
-use ee::verify_license_key;
 use monitor::{
     load_base_url, load_otel, reload_delete_logs_periodically_setting, reload_indexer_config,
     reload_instance_python_version_setting, reload_nuget_config_setting,
@@ -753,7 +752,7 @@ Windmill Community Edition {GIT_VERSION}
                                                         },
                                                         a@ _ if worker_mode && a == format!("worker__{}", *WORKER_GROUP) => {
                                                             tracing::info!("Worker config change detected: {}", n.payload());
-                                                            reload_worker_config(&db, tx.clone(), true).await;
+                                                            reload_worker_config(&conn, tx.clone(), true).await;
                                                         },
                                                         _ => {
                                                             tracing::debug!("config changed but did not target this server/worker");
@@ -818,16 +817,16 @@ Windmill Community Edition {GIT_VERSION}
                                                             reload_indexer_config(&db).await;
                                                         },
                                                         TIMEOUT_WAIT_RESULT_SETTING => {
-                                                            reload_timeout_wait_result_setting(&db).await
+                                                            reload_timeout_wait_result_setting(&conn).await
                                                         },
                                                         RETENTION_PERIOD_SECS_SETTING => {
-                                                            reload_retention_period_setting(&db).await
+                                                            reload_retention_period_setting(&conn).await
                                                         },
                                                         MONITOR_LOGS_ON_OBJECT_STORE_SETTING => {
-                                                            reload_delete_logs_periodically_setting(&db).await
+                                                            reload_delete_logs_periodically_setting(&conn).await
                                                         },
                                                         JOB_DEFAULT_TIMEOUT_SECS_SETTING => {
-                                                            reload_job_default_timeout_setting(&db).await
+                                                            reload_job_default_timeout_setting(&conn).await
                                                         },
                                                         #[cfg(feature = "parquet")]
                                                         OBJECT_STORE_CACHE_CONFIG_SETTING => {
@@ -836,28 +835,28 @@ Windmill Community Edition {GIT_VERSION}
                                                             }
                                                         },
                                                         SCIM_TOKEN_SETTING => {
-                                                            reload_scim_token_setting(&db).await
+                                                            reload_scim_token_setting(&conn).await
                                                         },
                                                         EXTRA_PIP_INDEX_URL_SETTING => {
-                                                            reload_extra_pip_index_url_setting(&db).await
+                                                            reload_extra_pip_index_url_setting(&conn).await
                                                         },
                                                         PIP_INDEX_URL_SETTING => {
-                                                            reload_pip_index_url_setting(&db).await
+                                                            reload_pip_index_url_setting(&conn).await
                                                         },
                                                         INSTANCE_PYTHON_VERSION_SETTING => {
-                                                            reload_instance_python_version_setting(&db).await
+                                                            reload_instance_python_version_setting(&conn).await
                                                         },
                                                         NPM_CONFIG_REGISTRY_SETTING => {
-                                                            reload_npm_config_registry_setting(&db).await
+                                                            reload_npm_config_registry_setting(&conn).await
                                                         },
                                                         BUNFIG_INSTALL_SCOPES_SETTING => {
-                                                            reload_bunfig_install_scopes_setting(&db).await
+                                                            reload_bunfig_install_scopes_setting(&conn).await
                                                         },
                                                         NUGET_CONFIG_SETTING => {
-                                                            reload_nuget_config_setting(&db).await
+                                                            reload_nuget_config_setting(&conn).await
                                                         },
                                                         KEEP_JOB_DIR_SETTING => {
-                                                            load_keep_job_dir(&db).await;
+                                                            load_keep_job_dir(&conn).await;
                                                         },
                                                         REQUIRE_PREEXISTING_USER_FOR_OAUTH_SETTING => {
                                                             load_require_preexisting_user(&db).await;
@@ -892,7 +891,7 @@ Windmill Community Edition {GIT_VERSION}
                                                             send_delayed_killpill(&tx, 0, "SAML metadata change").await;
                                                         },
                                                         HUB_BASE_URL_SETTING => {
-                                                            if let Err(e) = reload_hub_base_url_setting(&db, server_mode).await {
+                                                            if let Err(e) = reload_hub_base_url_setting(&conn, server_mode).await {
                                                                 tracing::error!(error = %e, "Could not reload hub base url setting");
                                                             }
                                                         },
@@ -996,7 +995,7 @@ Windmill Community Edition {GIT_VERSION}
                             tracing::info!("Reloading config after 12 hours");
                             initial_load(&conn, tx.clone(), worker_mode, server_mode, #[cfg(feature = "parquet")] disable_s3_store).await;
                             #[cfg(feature = "enterprise")]
-                            verify_license_key().await;
+                            ee::verify_license_key().await;
                         }
                     }
                 },

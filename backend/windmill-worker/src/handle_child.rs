@@ -5,7 +5,6 @@ use nix::sys::signal::{self, Signal};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::unistd::Pid;
 
-use sqlx::{Pool, Postgres};
 #[cfg(windows)]
 use std::process::Stdio;
 use tokio::fs::File;
@@ -31,7 +30,6 @@ use std::{io, panic, time::Duration};
 
 use tracing::{trace_span, Instrument};
 use uuid::Uuid;
-use windmill_common::DB;
 
 #[cfg(feature = "enterprise")]
 use windmill_common::job_metrics;
@@ -191,8 +189,6 @@ pub async fn handle_child(
 
     /* a future that completes when the child process exits */
     let wait_on_child = async {
-        let db = conn.clone();
-
         let kill_reason = tokio::select! {
             biased;
             result = child.wait() => return result.map(Ok),

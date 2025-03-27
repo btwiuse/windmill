@@ -8,7 +8,6 @@ use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
 use uuid::Uuid;
-use windmill_common::DB;
 
 #[cfg(not(all(feature = "enterprise", feature = "parquet")))]
 use crate::job_logger_ee::default_disk_log_storage;

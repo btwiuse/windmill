@@ -12,7 +12,6 @@
 use anyhow::anyhow;
 use futures::TryFutureExt;
 use windmill_common::{
-    agent_workers::QueueInitJob,
     apps::AppScriptId,
     auth::{fetch_authed_from_permissioned_as, JWTAuthClaims, JobPerms},
     cache::{future::FutureCachedExt, ScriptData, ScriptMetadata},
@@ -20,11 +19,8 @@ use windmill_common::{
     schema::{should_validate_schema, SchemaValidator},
     scripts::PREVIEW_IS_TAR_CODEBASE_HASH,
     utils::WarnAfterExt,
-    worker::{
-        get_memory, get_vcpus, get_windmill_memory_usage, get_worker_memory_usage, write_file,
-        Connection, ROOT_CACHE_DIR, ROOT_CACHE_NOMOUNT_DIR, TMP_DIR,
-    },
-    KillpillSender, BASE_URL,
+    worker::{write_file, Connection, ROOT_CACHE_DIR, ROOT_CACHE_NOMOUNT_DIR, TMP_DIR},
+    KillpillSender,
 };
 
 #[cfg(feature = "enterprise")]
@@ -43,7 +39,7 @@ use windmill_common::METRICS_ENABLED;
 
 use reqwest::Response;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sqlx::{types::Json, Pool, Postgres};
+use sqlx::types::Json;
 use std::{
     collections::HashMap,
     fs::DirBuilder,
@@ -63,15 +59,14 @@ use windmill_common::{
     flows::FlowNodeId,
     jobs::JobKind,
     scripts::{get_full_hub_script_by_path, ScriptHash, ScriptLang, PREVIEW_IS_CODEBASE_HASH},
-    users::SUPERADMIN_SECRET_EMAIL,
     utils::StripPath,
     worker::{update_ping, CLOUD_HOSTED, NO_LOGS, WORKER_CONFIG, WORKER_GROUP},
     DB, IS_READY,
 };
 
 use windmill_queue::{
-    append_logs, canceled_job_to_result, empty_result, pull, push, push_init_job, CanceledBy,
-    MiniPulledJob, PulledJob, PushArgs, PushIsolationLevel, HTTP_CLIENT,
+    append_logs, canceled_job_to_result, empty_result, pull, push_init_job, CanceledBy,
+    MiniPulledJob, PulledJob, HTTP_CLIENT,
 };
 
 #[cfg(feature = "prometheus")]
@@ -118,7 +113,7 @@ use crate::{
     worker_lockfiles::{
         handle_app_dependency_job, handle_dependency_job, handle_flow_dependency_job,
     },
-    worker_utils::{pull_same_worker_job, queue_vacuum, update_worker_ping_full},
+    worker_utils::{queue_vacuum, update_worker_ping_full},
 };
 
 #[cfg(feature = "rust")]
@@ -141,9 +136,6 @@ use crate::mysql_executor::do_mysql;
 
 #[cfg(feature = "oracledb")]
 use crate::oracledb_executor::do_oracledb;
-
-use backon::ConstantBuilder;
-use backon::{BackoffBuilder, Retryable};
 
 #[cfg(feature = "enterprise")]
 use crate::dedicated_worker::create_dedicated_worker_map;

@@ -8,14 +8,13 @@
 
 use crate::{
     db::{ApiAuthed, DB},
-    users::{maybe_refresh_folders, require_owner_of_path},
     utils::require_super_admin,
 };
 
 use axum::{
     async_trait,
-    extract::{Extension, FromRequestParts, Path},
-    routing::{delete, post},
+    extract::{Extension, FromRequestParts},
+    routing::post,
     Json, Router,
 };
 use http::request::Parts;
@@ -23,10 +22,8 @@ use hyper::StatusCode;
 use serde::{Deserialize, Serialize};
 use windmill_common::{
     agent_workers::QueueInitJob,
-    db::UserDB,
     error::Result,
-    jwt::{decode_with_internal_secret, encode_with_internal_secret, JWT_SECRET},
-    utils::StripPath,
+    jwt::{decode_with_internal_secret, encode_with_internal_secret},
 };
 use windmill_queue::push_init_job;
 

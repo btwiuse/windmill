@@ -10,7 +10,6 @@ use anyhow::anyhow;
 use itertools::Itertools;
 use regex::Regex;
 use serde_json::value::RawValue;
-use sqlx::{Pool, Postgres};
 use tokio::{
     fs::{metadata, DirBuilder, File},
     io::AsyncReadExt,
@@ -28,7 +27,6 @@ use windmill_common::{
     },
     utils::calculate_hash,
     worker::{write_file, Connection, PythonAnnotations, WORKER_CONFIG},
-    DB,
 };
 
 #[cfg(feature = "enterprise")]

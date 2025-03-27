@@ -1,16 +1,14 @@
 use backon::{BackoffBuilder, ConstantBuilder, Retryable};
 use tracing::Instrument;
 use windmill_common::{
-    error::{self, Error},
     worker::{
         get_memory, get_vcpus, get_windmill_memory_usage, get_worker_memory_usage, Connection,
         WORKER_CONFIG,
     },
     KillpillSender,
 };
-use windmill_queue::PulledJob;
 
-use crate::{common::OccupancyMetrics, JobCompletedSender, SameWorkerPayload};
+use crate::common::OccupancyMetrics;
 
 pub(crate) async fn update_worker_ping_full(
     conn: &Connection,
@@ -144,51 +142,6 @@ pub(crate) async fn queue_vacuum(conn: &Connection, worker_name: &str, hostname:
         Connection::Http => {
             // do nothing in http mode
             ()
-        }
-    }
-}
-
-pub(crate) async fn pull_same_worker_job(
-    conn: &Connection,
-    worker_name: &str,
-    hostname: &str,
-    same_worker_job: SameWorkerPayload,
-    job_completed_tx: &JobCompletedSender,
-) -> error::Result<Option<PulledJob>> {
-    tracing::debug!(
-        worker = %worker_name, hostname = %hostname,
-        "received {} from same worker channel",
-        same_worker_job.job_id
-    );
-    match conn {
-        Connection::Sql(db) => {
-            let r = sqlx::query_as::<_, PulledJob>(
-                "
-                    WITH ping AS (
-                        UPDATE v2_job_runtime SET ping = NOW() WHERE id = $1 RETURNING id
-                    )
-                    SELECT * FROM v2_as_queue WHERE id = (SELECT id FROM ping)
-                    ",
-            )
-            .bind(same_worker_job.job_id)
-            .fetch_optional(db)
-            .await
-            .map_err(|e| {
-                Error::internal_err(format!(
-                    "Impossible to fetch same_worker job {}: {}",
-                    same_worker_job.job_id, e
-                ))
-            });
-            let _ = sqlx::query!(
-                "UPDATE v2_job_queue SET started_at = NOW() WHERE id = $1",
-                same_worker_job.job_id
-            )
-            .execute(db)
-            .await;
-            r
-        }
-        Connection::Http => {
-            todo!()
         }
     }
 }

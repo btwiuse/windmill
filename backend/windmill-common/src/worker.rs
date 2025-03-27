@@ -777,20 +777,26 @@ pub async fn update_ping(worker_instance: &str, worker_name: &str, ip: &str, db:
 }
 
 pub async fn load_worker_config(
-    db: &DB,
+    conn: &Connection,
     killpill_tx: KillpillSender,
 ) -> error::Result<WorkerConfig> {
     tracing::info!("Loading config from WORKER_GROUP: {}", *WORKER_GROUP);
-    let mut config: WorkerConfigOpt = sqlx::query_scalar!(
-        "SELECT config FROM config WHERE name = $1",
-        format!("worker__{}", *WORKER_GROUP)
-    )
-    .fetch_optional(db)
-    .await?
-    .flatten()
-    .map(|x| serde_json::from_value(x).ok())
-    .flatten()
-    .unwrap_or_default();
+    let mut config: WorkerConfigOpt = match conn {
+        Connection::Sql(pool) => sqlx::query_scalar!(
+            "SELECT config FROM config WHERE name = $1",
+            format!("worker__{}", *WORKER_GROUP)
+        )
+        .fetch_optional(pool)
+        .await?
+        .flatten()
+        .map(|x| serde_json::from_value(x).ok())
+        .flatten()
+        .unwrap_or_default(),
+        Connection::Http => {
+            tracing::error!("todo: Cannot load config in http mode");
+            WorkerConfigOpt::default()
+        }
+    };
 
     if config.dedicated_worker.is_none() {
         let dw = std::env::var("DEDICATED_WORKER").ok();

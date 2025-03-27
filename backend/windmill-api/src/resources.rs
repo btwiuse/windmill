@@ -33,7 +33,6 @@ use windmill_common::{
     error::{Error, JsonResult, Result},
     utils::{not_found_if_none, paginate, require_admin, Pagination, StripPath},
     variables,
-    worker::Connection,
 };
 
 pub fn workspaced_service() -> Router {

@@ -150,11 +150,11 @@ pub async fn initial_load(
     }
 
     if worker_mode {
-        load_keep_job_dir(db).await;
-        reload_worker_config(&db, tx, false).await;
+        load_keep_job_dir(conn).await;
+        reload_worker_config(&conn, tx, false).await;
     }
 
-    if let Err(e) = reload_hub_base_url_setting(db, server_mode).await {
+    if let Err(e) = reload_hub_base_url_setting(conn, server_mode).await {
         tracing::error!("Error reloading hub base url: {:?}", e)
     }
 
@@ -179,24 +179,20 @@ pub async fn initial_load(
     }
 
     if server_mode {
-        if let Some(db) = conn.as_sql() {
-            reload_retention_period_setting(&db).await;
-            reload_request_size(&db).await;
-            reload_saml_metadata_setting(&db).await;
-            reload_scim_token_setting(&db).await;
-        } else {
-            panic!("Server mode requires a database connection");
-        }
+        reload_retention_period_setting(&conn).await;
+        reload_request_size(&conn).await;
+        reload_saml_metadata_setting(&conn).await;
+        reload_scim_token_setting(&conn).await;
     }
 
     if worker_mode {
-        reload_job_default_timeout_setting(&db).await;
-        reload_extra_pip_index_url_setting(&db).await;
-        reload_pip_index_url_setting(&db).await;
-        reload_npm_config_registry_setting(&db).await;
-        reload_bunfig_install_scopes_setting(&db).await;
-        reload_instance_python_version_setting(&db).await;
-        reload_nuget_config_setting(&db).await;
+        reload_job_default_timeout_setting(&conn).await;
+        reload_extra_pip_index_url_setting(&conn).await;
+        reload_pip_index_url_setting(&conn).await;
+        reload_npm_config_registry_setting(&conn).await;
+        reload_bunfig_install_scopes_setting(&conn).await;
+        reload_instance_python_version_setting(&conn).await;
+        reload_nuget_config_setting(&conn).await;
     }
 }
 
@@ -633,8 +629,8 @@ fn read_log_counters(ts_str: String) -> (usize, usize) {
     (ok_lines, err_lines)
 }
 
-pub async fn load_keep_job_dir(db: &DB) {
-    let value = load_value_from_global_settings(db, KEEP_JOB_DIR_SETTING).await;
+pub async fn load_keep_job_dir(conn: &Connection) {
+    let value = load_value_from_global_settings_with_conn(conn, KEEP_JOB_DIR_SETTING, true).await;
     match value {
         Ok(Some(serde_json::Value::Bool(t))) => KEEP_JOB_DIR.store(t, Ordering::Relaxed),
         Err(e) => {
@@ -901,23 +897,23 @@ async fn delete_log_files_from_disk_and_store(
     let _: Vec<_> = delete_futures.collect().await;
 }
 
-pub async fn reload_scim_token_setting(db: &DB) {
-    reload_option_setting_with_tracing(db, SCIM_TOKEN_SETTING, "SCIM_TOKEN", SCIM_TOKEN.clone())
+pub async fn reload_scim_token_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(conn, SCIM_TOKEN_SETTING, "SCIM_TOKEN", SCIM_TOKEN.clone())
         .await;
 }
 
-pub async fn reload_timeout_wait_result_setting(db: &DB) {
+pub async fn reload_timeout_wait_result_setting(conn: &Connection) {
     reload_option_setting_with_tracing(
-        db,
+        conn,
         TIMEOUT_WAIT_RESULT_SETTING,
         "TIMEOUT_WAIT_RESULT",
         TIMEOUT_WAIT_RESULT.clone(),
     )
     .await;
 }
-pub async fn reload_saml_metadata_setting(db: &DB) {
+pub async fn reload_saml_metadata_setting(conn: &Connection) {
     reload_option_setting_with_tracing(
-        db,
+        conn,
         SAML_METADATA_SETTING,
         "SAML_METADATA",
         SAML_METADATA.clone(),
@@ -925,9 +921,9 @@ pub async fn reload_saml_metadata_setting(db: &DB) {
     .await;
 }
 
-pub async fn reload_extra_pip_index_url_setting(db: &DB) {
+pub async fn reload_extra_pip_index_url_setting(conn: &Connection) {
     reload_option_setting_with_tracing(
-        db,
+        conn,
         EXTRA_PIP_INDEX_URL_SETTING,
         "PIP_EXTRA_INDEX_URL",
         PIP_EXTRA_INDEX_URL.clone(),
@@ -935,9 +931,9 @@ pub async fn reload_extra_pip_index_url_setting(db: &DB) {
     .await;
 }
 
-pub async fn reload_pip_index_url_setting(db: &DB) {
+pub async fn reload_pip_index_url_setting(conn: &Connection) {
     reload_option_setting_with_tracing(
-        db,
+        conn,
         PIP_INDEX_URL_SETTING,
         "PIP_INDEX_URL",
         PIP_INDEX_URL.clone(),
@@ -945,9 +941,9 @@ pub async fn reload_pip_index_url_setting(db: &DB) {
     .await;
 }
 
-pub async fn reload_instance_python_version_setting(db: &DB) {
+pub async fn reload_instance_python_version_setting(conn: &Connection) {
     reload_option_setting_with_tracing(
-        db,
+        conn,
         INSTANCE_PYTHON_VERSION_SETTING,
         "INSTANCE_PYTHON_VERSION",
         INSTANCE_PYTHON_VERSION.clone(),
@@ -955,9 +951,9 @@ pub async fn reload_instance_python_version_setting(db: &DB) {
     .await;
 }
 
-pub async fn reload_npm_config_registry_setting(db: &DB) {
+pub async fn reload_npm_config_registry_setting(conn: &Connection) {
     reload_option_setting_with_tracing(
-        db,
+        conn,
         NPM_CONFIG_REGISTRY_SETTING,
         "NPM_CONFIG_REGISTRY",
         NPM_CONFIG_REGISTRY.clone(),
@@ -965,9 +961,9 @@ pub async fn reload_npm_config_registry_setting(db: &DB) {
     .await;
 }
 
-pub async fn reload_bunfig_install_scopes_setting(db: &DB) {
+pub async fn reload_bunfig_install_scopes_setting(conn: &Connection) {
     reload_option_setting_with_tracing(
-        db,
+        conn,
         BUNFIG_INSTALL_SCOPES_SETTING,
         "BUNFIG_INSTALL_SCOPES",
         BUNFIG_INSTALL_SCOPES.clone(),
@@ -975,9 +971,9 @@ pub async fn reload_bunfig_install_scopes_setting(db: &DB) {
     .await;
 }
 
-pub async fn reload_nuget_config_setting(db: &DB) {
+pub async fn reload_nuget_config_setting(conn: &Connection) {
     reload_option_setting_with_tracing(
-        db,
+        conn,
         NUGET_CONFIG_SETTING,
         "NUGET_CONFIG",
         NUGET_CONFIG.clone(),
@@ -985,9 +981,9 @@ pub async fn reload_nuget_config_setting(db: &DB) {
     .await;
 }
 
-pub async fn reload_retention_period_setting(db: &DB) {
+pub async fn reload_retention_period_setting(conn: &Connection) {
     if let Err(e) = reload_setting(
-        db,
+        conn,
         RETENTION_PERIOD_SECS_SETTING,
         "JOB_RETENTION_SECS",
         60 * 60 * 24 * 30,
@@ -999,9 +995,9 @@ pub async fn reload_retention_period_setting(db: &DB) {
         tracing::error!("Error reloading retention period: {:?}", e)
     }
 }
-pub async fn reload_delete_logs_periodically_setting(db: &DB) {
+pub async fn reload_delete_logs_periodically_setting(conn: &Connection) {
     if let Err(e) = reload_setting(
-        db,
+        conn,
         MONITOR_LOGS_ON_OBJECT_STORE_SETTING,
         "MONITOR_LOGS_ON_OBJECT_STORE",
         false,
@@ -1069,9 +1065,9 @@ pub async fn reload_s3_cache_setting(db: &DB) {
     }
 }
 
-pub async fn reload_job_default_timeout_setting(db: &DB) {
+pub async fn reload_job_default_timeout_setting(conn: &Connection) {
     reload_option_setting_with_tracing(
-        db,
+        conn,
         JOB_DEFAULT_TIMEOUT_SECS_SETTING,
         "JOB_DEFAULT_TIMEOUT_SECS",
         JOB_DEFAULT_TIMEOUT.clone(),
@@ -1079,9 +1075,9 @@ pub async fn reload_job_default_timeout_setting(db: &DB) {
     .await;
 }
 
-pub async fn reload_request_size(db: &DB) {
+pub async fn reload_request_size(conn: &Connection) {
     if let Err(e) = reload_setting(
-        db,
+        conn,
         REQUEST_SIZE_LIMIT_SETTING,
         "REQUEST_SIZE_LIMIT",
         DEFAULT_BODY_LIMIT,
@@ -1120,12 +1116,12 @@ pub async fn reload_license_key(conn: &Connection) -> anyhow::Result<()> {
 }
 
 pub async fn reload_option_setting_with_tracing<T: FromStr + DeserializeOwned>(
-    db: &DB,
+    conn: &Connection,
     setting_name: &str,
     std_env_var: &str,
     lock: Arc<RwLock<Option<T>>>,
 ) {
-    if let Err(e) = reload_option_setting(db, setting_name, std_env_var, lock.clone()).await {
+    if let Err(e) = reload_option_setting(conn, setting_name, std_env_var, lock.clone()).await {
         tracing::error!("Error reloading setting {}: {:?}", setting_name, e)
     }
 }
@@ -1160,7 +1156,7 @@ pub async fn load_value_from_global_settings_with_conn(
 }
 
 pub async fn reload_option_setting<T: FromStr + DeserializeOwned>(
-    db: &DB,
+    conn: &Connection,
     setting_name: &str,
     std_env_var: &str,
     lock: Arc<RwLock<Option<T>>>,
@@ -1175,7 +1171,7 @@ pub async fn reload_option_setting<T: FromStr + DeserializeOwned>(
         return Ok(());
     }
 
-    let q = load_value_from_global_settings(db, setting_name).await?;
+    let q = load_value_from_global_settings_with_conn(conn, setting_name, true).await?;
 
     let mut value = std::env::var(std_env_var)
         .ok()
@@ -1202,14 +1198,14 @@ pub async fn reload_option_setting<T: FromStr + DeserializeOwned>(
 }
 
 pub async fn reload_setting<T: FromStr + DeserializeOwned + Display>(
-    db: &DB,
+    conn: &Connection,
     setting_name: &str,
     std_env_var: &str,
     default: T,
     lock: Arc<RwLock<T>>,
     transformer: fn(T) -> T,
 ) -> error::Result<()> {
-    let q = load_value_from_global_settings(db, setting_name).await?;
+    let q = load_value_from_global_settings_with_conn(conn, setting_name, true).await?;
 
     let mut value = std::env::var(std_env_var)
         .ok()
@@ -1461,11 +1457,11 @@ pub async fn reload_indexer_config(db: &Pool<Postgres>) {
 }
 
 pub async fn reload_worker_config(
-    db: &DB,
+    conn: &Connection,
     tx: KillpillSender,
     kill_if_change: bool,
 ) {
-    let config = load_worker_config(&db, tx.clone()).await;
+    let config = load_worker_config(conn, tx.clone()).await;
     if let Err(e) = config {
         tracing::error!("Error reloading worker config: {:?}", e)
     } else {
@@ -1539,11 +1535,10 @@ pub async fn load_base_url(conn: &Connection) -> error::Result<String> {
 
 pub async fn reload_base_url_setting(conn: &Connection) -> error::Result<()> {
 
+    #[cfg(feature = "oauth2")]
     if let Some(db) = conn.as_sql() {
-        #[cfg(feature = "oauth2")]
         let q_oauth = load_value_from_global_settings(db, OAUTH_SETTING).await?;
 
-        #[cfg(feature = "oauth2")]
         let oauths = if let Some(q) = q_oauth {
             if let Ok(v) = serde_json::from_value::<
                 Option<HashMap<String, windmill_api::oauth2_ee::OAuthClient>>,
@@ -2034,8 +2029,8 @@ async fn cancel_zombie_flow_job(
     Ok(())
 }
 
-pub async fn reload_hub_base_url_setting(db: &DB, server_mode: bool) -> error::Result<()> {
-    let hub_base_url = load_value_from_global_settings(db, HUB_BASE_URL_SETTING).await?;
+pub async fn reload_hub_base_url_setting(conn: &Connection, server_mode: bool) -> error::Result<()> {
+    let hub_base_url = load_value_from_global_settings_with_conn(conn, HUB_BASE_URL_SETTING, true).await?;
 
     let base_url = if let Some(q) = hub_base_url {
         if let Ok(v) = serde_json::from_value::<String>(q.clone()) {
