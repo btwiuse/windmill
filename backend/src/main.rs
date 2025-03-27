@@ -244,23 +244,6 @@ async fn cache_hub_scripts(file_path: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn windmill_main_agent() -> anyhow::Result<()> {
-    println!("Running in agent mode");
-
-    // run_workers(
-    //     db.clone(),
-    //     rx,
-    //     killpill_tx.clone(),
-    //     num_workers,
-    //     base_internal_url.clone(),
-    //     is_agent,
-    //     hostname.clone(),
-    // )
-    // .await?;
-
-    Ok(())
-}
-
 async fn windmill_main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
@@ -276,16 +259,6 @@ async fn windmill_main() -> anyhow::Result<()> {
 
     let mode_and_addons = MODE_AND_ADDONS.clone();
     let mode = mode_and_addons.mode;
-
-    if mode == Mode::Agent {
-        return windmill_main_agent().await;
-    }
-    #[cfg(feature = "only_agent")]
-    {
-        return Err(anyhow::anyhow!(
-            "only_agent binary can only be used in agent mode"
-        ));
-    }
 
     if mode == Mode::Standalone {
         println!("Running in standalone mode");
