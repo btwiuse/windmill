@@ -198,11 +198,6 @@ pub async fn create_token_for_owner(
     job_id: &Uuid,
     perms: Option<JobPerms>,
 ) -> error::Result<String> {
-    // TODO: Bad implementation. We should not have access to this DB here.
-    if let Some(token) = JOB_TOKEN.as_ref() {
-        return Ok(token.clone());
-    }
-
     let job_perms = if perms.is_some() {
         Ok(perms)
     } else {
@@ -343,8 +338,6 @@ const DOTNET_DEFAULT_PATH: &str = "C:\\Program Files\\dotnet\\dotnet.exe";
 const DOTNET_DEFAULT_PATH: &str = "/usr/bin/dotnet";
 
 lazy_static::lazy_static! {
-
-    pub static ref JOB_TOKEN: Option<String> = std::env::var("JOB_TOKEN").ok();
 
     pub static ref SLEEP_QUEUE: u64 = std::env::var("SLEEP_QUEUE")
     .ok()

@@ -571,7 +571,7 @@ async fn spawn_dedicated_worker(
     };
     use windmill_queue::MiniPulledJob;
 
-    use crate::{build_envs, get_script_content_by_hash, ContentReqLangEnvs, JOB_TOKEN};
+    use crate::{build_envs, get_script_content_by_hash, ContentReqLangEnvs};
 
     #[cfg(not(feature = "enterprise"))]
     {
@@ -660,9 +660,7 @@ async fn spawn_dedicated_worker(
 
         let db = db.clone();
         let handle = tokio::spawn(async move {
-            let token = if let Some(token) = JOB_TOKEN.as_ref() {
-                token.clone()
-            } else {
+            let token = {
                 let token = rd_string(32);
                 if let Err(e) = sqlx::query_scalar!(
                     "INSERT INTO token

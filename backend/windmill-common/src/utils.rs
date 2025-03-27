@@ -75,8 +75,8 @@ lazy_static::lazy_static! {
                 if std::env::var("BASE_INTERNAL_URL").is_err() {
                     panic!("BASE_INTERNAL_URL is required in agent mode")
                 }
-                if std::env::var("JOB_TOKEN").is_err() {
-                    println!("JOB_TOKEN is not passed, hence workers will still need to create permissions for each job and the DATABASE_URL needs to be of a role that can INSERT into the job_perms table")
+                if std::env::var("AGENT_TOKEN").is_err() {
+                    println!("AGENT_TOKEN is not passed. This is required for the agent to work and contains the JWT to authenticate with the server.")
                 }
 
                 #[cfg(not(feature = "enterprise"))]

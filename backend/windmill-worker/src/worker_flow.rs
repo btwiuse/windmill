@@ -16,8 +16,7 @@ use crate::bench::BenchmarkIter;
 use crate::common::{cached_result_path, save_in_cache};
 use crate::js_eval::{eval_timeout, IdContext};
 use crate::{
-    AuthedClient, PreviousResult, SameWorkerPayload, SameWorkerSender, SendResult, JOB_TOKEN,
-    KEEP_JOB_DIR,
+    AuthedClient, PreviousResult, SameWorkerPayload, SameWorkerSender, SendResult, KEEP_JOB_DIR,
 };
 use anyhow::Context;
 use futures::TryFutureExt;
@@ -2650,7 +2649,7 @@ async fn push_next_flow_job(
         };
 
         // forward root job permissions to the new job
-        let job_perms: Option<Authed> = if JOB_TOKEN.is_none() {
+        let job_perms: Option<Authed> = {
             if let Some(root_job) = &flow_job
                 .flow_innermost_root_job
                 .or_else(|| Some(flow_job.id))
@@ -2667,8 +2666,6 @@ async fn push_next_flow_job(
             } else {
                 None
             }
-        } else {
-            None
         };
 
         tracing::debug!(id = %flow_job.id, root_id = %job_root, "computed perms for job {i} of {len}");
