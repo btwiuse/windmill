@@ -7,6 +7,7 @@
  */
 
 use anyhow::Context;
+use ee::verify_license_key;
 use monitor::{
     load_base_url, load_otel, reload_delete_logs_periodically_setting, reload_indexer_config,
     reload_instance_python_version_setting, reload_nuget_config_setting,
@@ -650,18 +651,20 @@ Windmill Community Edition {GIT_VERSION}
 
         let server_f = async {
             if !is_agent {
-                windmill_api::run_server(
-                    db.clone(),
-                    index_reader,
-                    log_index_reader,
-                    addr,
-                    server_killpill_rx,
-                    base_internal_tx,
-                    server_mode,
-                    #[cfg(feature = "smtp")]
-                    base_internal_url.clone(),
-                )
-                .await?;
+                if let Some(db) = conn.as_sql() {
+                    windmill_api::run_server(
+                        db.clone(),
+                        index_reader,
+                        log_index_reader,
+                        addr,
+                        server_killpill_rx,
+                        base_internal_tx,
+                        server_mode,
+                        #[cfg(feature = "smtp")]
+                        base_internal_url.clone(),
+                    )
+                    .await?;
+                }
             } else {
                 base_internal_tx
                     .send(base_internal_url.clone())
@@ -707,279 +710,298 @@ Windmill Community Edition {GIT_VERSION}
         };
 
         let monitor_f = async {
-            let db = db.clone();
             let tx = killpill_tx.clone();
-
-            let base_internal_url = base_internal_url.to_string();
-            let db_url: String = get_database_url().await?;
-
-            let h = tokio::spawn(async move {
-                let mut listener = retry_listen_pg(&db_url).await;
-                let mut last_listener_refresh = Instant::now();
-                loop {
-                    tokio::select! {
-                        biased;
-                        Some(_) = async { if let Some(jh) = migration_handle.take() {
-                            tracing::info!("migration job finished");
-                            Some(jh.await)
-                        } else {
-                            None
-                        }} => {
-                           continue;
-                        },
-                        _ = monitor_killpill_rx.recv() => {
-                            tracing::info!("received killpill for monitor job");
-                            break;
-                        },
-                        notification = listener.try_recv() => {
-                            match notification {
-                                Ok(n) => {
-                                    if n.is_none() {
-                                        tracing::error!("Could not receive notification, attempting to reconnect to pg listener");
-                                        continue;
-                                    }
-                                    let n = n.unwrap();
-                                    tracing::info!("Received new pg notification: {n:?}");
-                                    match n.channel() {
-                                        "notify_config_change" => {
-                                            match n.payload() {
-                                                "server" if server_mode => {
-                                                    tracing::error!("Server config change detected but server config is obsolete: {}", n.payload());
+            let conn = conn.clone();
+            match conn {
+                Connection::Sql(ref db) => {
+                    let base_internal_url = base_internal_url.to_string();
+                    let db_url: String = get_database_url().await?;
+                    let db = db.clone();
+                    let h = tokio::spawn(async move {
+                        let mut listener = retry_listen_pg(&db_url).await;
+                        let mut last_listener_refresh = Instant::now();
+                        loop {
+                            let db = db.clone();
+                            tokio::select! {
+                                biased;
+                                Some(_) = async { if let Some(jh) = migration_handle.take() {
+                                    tracing::info!("migration job finished");
+                                    Some(jh.await)
+                                } else {
+                                    None
+                                }} => {
+                                   continue;
+                                },
+                                _ = monitor_killpill_rx.recv() => {
+                                    tracing::info!("received killpill for monitor job");
+                                    break;
+                                },
+                                notification = listener.try_recv() => {
+                                    match notification {
+                                        Ok(n) => {
+                                            if n.is_none() {
+                                                tracing::error!("Could not receive notification, attempting to reconnect to pg listener");
+                                                continue;
+                                            }
+                                            let n = n.unwrap();
+                                            tracing::info!("Received new pg notification: {n:?}");
+                                            match n.channel() {
+                                                "notify_config_change" => {
+                                                    match n.payload() {
+                                                        "server" if server_mode => {
+                                                            tracing::error!("Server config change detected but server config is obsolete: {}", n.payload());
+                                                        },
+                                                        a@ _ if worker_mode && a == format!("worker__{}", *WORKER_GROUP) => {
+                                                            tracing::info!("Worker config change detected: {}", n.payload());
+                                                            reload_worker_config(&db, tx.clone(), true).await;
+                                                        },
+                                                        _ => {
+                                                            tracing::debug!("config changed but did not target this server/worker");
+                                                        }
+                                                    }
                                                 },
-                                                a@ _ if worker_mode && a == format!("worker__{}", *WORKER_GROUP) => {
-                                                    tracing::info!("Worker config change detected: {}", n.payload());
-                                                    reload_worker_config(&db, tx.clone(), true).await;
+                                                "notify_webhook_change" => {
+                                                    let workspace_id = n.payload();
+                                                    tracing::info!("Webhook change detected, invalidating webhook cache: {}", workspace_id);
+                                                    windmill_api::webhook_util::WEBHOOK_CACHE.remove(workspace_id);
+                                                },
+                                                "notify_workspace_envs_change" => {
+                                                    let workspace_id = n.payload();
+                                                    tracing::info!("Workspace envs change detected, invalidating workspace envs cache: {}", workspace_id);
+                                                    windmill_common::variables::CUSTOM_ENVS_CACHE.remove(workspace_id);
+                                                },
+                                                "notify_workspace_premium_change" => {
+                                                    let workspace_id = n.payload();
+                                                    tracing::info!("Workspace premium change detected, invalidating workspace premium cache: {}", workspace_id);
+                                                    windmill_common::workspaces::IS_PREMIUM_CACHE.remove(workspace_id);
+                                                },
+                                                "notify_global_setting_change" => {
+                                                    tracing::info!("Global setting change detected: {}", n.payload());
+                                                    match n.payload() {
+                                                        BASE_URL_SETTING => {
+                                                            if let Err(e) = reload_base_url_setting(&conn).await {
+                                                                tracing::error!(error = %e, "Could not reload base url setting");
+                                                            }
+                                                        },
+                                                        OAUTH_SETTING => {
+                                                            if let Err(e) = reload_base_url_setting(&conn).await {
+                                                                tracing::error!(error = %e, "Could not reload oauth setting");
+                                                            }
+                                                        },
+                                                        CUSTOM_TAGS_SETTING => {
+                                                            if let Err(e) = reload_custom_tags_setting(&db).await {
+                                                                tracing::error!(error = %e, "Could not reload custom tags setting");
+                                                            }
+                                                        },
+                                                        LICENSE_KEY_SETTING => {
+                                                            if let Err(e) = reload_license_key(&db.into()).await {
+                                                                tracing::error!("Failed to reload license key: {e:#}");
+                                                            }
+                                                        },
+                                                        DEFAULT_TAGS_PER_WORKSPACE_SETTING => {
+                                                            if let Err(e) = load_tag_per_workspace_enabled(&db).await {
+                                                                tracing::error!("Error loading default tag per workspace: {e:#}");
+                                                            }
+                                                        },
+                                                        DEFAULT_TAGS_WORKSPACES_SETTING => {
+                                                            if let Err(e) = load_tag_per_workspace_workspaces(&db).await {
+                                                                tracing::error!("Error loading default tag per workspace workspaces: {e:#}");
+                                                            }
+                                                        }
+                                                        SMTP_SETTING => {
+                                                            reload_smtp_config(&db).await;
+                                                        },
+                                                        TEAMS_SETTING => {
+                                                            tracing::info!("Teams setting changed.");
+                                                        },
+                                                        INDEXER_SETTING => {
+                                                            reload_indexer_config(&db).await;
+                                                        },
+                                                        TIMEOUT_WAIT_RESULT_SETTING => {
+                                                            reload_timeout_wait_result_setting(&db).await
+                                                        },
+                                                        RETENTION_PERIOD_SECS_SETTING => {
+                                                            reload_retention_period_setting(&db).await
+                                                        },
+                                                        MONITOR_LOGS_ON_OBJECT_STORE_SETTING => {
+                                                            reload_delete_logs_periodically_setting(&db).await
+                                                        },
+                                                        JOB_DEFAULT_TIMEOUT_SECS_SETTING => {
+                                                            reload_job_default_timeout_setting(&db).await
+                                                        },
+                                                        #[cfg(feature = "parquet")]
+                                                        OBJECT_STORE_CACHE_CONFIG_SETTING => {
+                                                            if !disable_s3_store {
+                                                                reload_s3_cache_setting(&db).await
+                                                            }
+                                                        },
+                                                        SCIM_TOKEN_SETTING => {
+                                                            reload_scim_token_setting(&db).await
+                                                        },
+                                                        EXTRA_PIP_INDEX_URL_SETTING => {
+                                                            reload_extra_pip_index_url_setting(&db).await
+                                                        },
+                                                        PIP_INDEX_URL_SETTING => {
+                                                            reload_pip_index_url_setting(&db).await
+                                                        },
+                                                        INSTANCE_PYTHON_VERSION_SETTING => {
+                                                            reload_instance_python_version_setting(&db).await
+                                                        },
+                                                        NPM_CONFIG_REGISTRY_SETTING => {
+                                                            reload_npm_config_registry_setting(&db).await
+                                                        },
+                                                        BUNFIG_INSTALL_SCOPES_SETTING => {
+                                                            reload_bunfig_install_scopes_setting(&db).await
+                                                        },
+                                                        NUGET_CONFIG_SETTING => {
+                                                            reload_nuget_config_setting(&db).await
+                                                        },
+                                                        KEEP_JOB_DIR_SETTING => {
+                                                            load_keep_job_dir(&db).await;
+                                                        },
+                                                        REQUIRE_PREEXISTING_USER_FOR_OAUTH_SETTING => {
+                                                            load_require_preexisting_user(&db).await;
+                                                        },
+                                                        EXPOSE_METRICS_SETTING  => {
+                                                            tracing::info!("Metrics setting changed, restarting");
+                                                            send_delayed_killpill(&tx, 40, "metrics setting change").await;
+                                                        },
+                                                        EMAIL_DOMAIN_SETTING => {
+                                                            tracing::info!("Email domain setting changed");
+                                                            if server_mode {
+                                                                send_delayed_killpill(&tx, 4, "email domain setting change").await;
+                                                            }
+                                                        },
+                                                        EXPOSE_DEBUG_METRICS_SETTING => {
+                                                            if let Err(e) = load_metrics_debug_enabled(&conn).await {
+                                                                tracing::error!(error = %e, "Could not reload debug metrics setting");
+                                                            }
+                                                        },
+                                                        OTEL_SETTING => {
+                                                            tracing::info!("OTEL setting changed, restarting");
+                                                            send_delayed_killpill(&tx, 4, "OTEL setting change").await;
+                                                        },
+                                                        REQUEST_SIZE_LIMIT_SETTING => {
+                                                            if server_mode {
+                                                                tracing::info!("Request limit size change detected, killing server expecting to be restarted");
+                                                                send_delayed_killpill(&tx, 4, "request size limit change").await;
+                                                            }
+                                                        },
+                                                        SAML_METADATA_SETTING => {
+                                                            tracing::info!("SAML metadata change detected, killing server expecting to be restarted");
+                                                            send_delayed_killpill(&tx, 0, "SAML metadata change").await;
+                                                        },
+                                                        HUB_BASE_URL_SETTING => {
+                                                            if let Err(e) = reload_hub_base_url_setting(&db, server_mode).await {
+                                                                tracing::error!(error = %e, "Could not reload hub base url setting");
+                                                            }
+                                                        },
+                                                        CRITICAL_ERROR_CHANNELS_SETTING => {
+                                                            if let Err(e) = reload_critical_error_channels_setting(&db).await {
+                                                                tracing::error!(error = %e, "Could not reload critical error emails setting");
+                                                            }
+                                                        },
+                                                        JWT_SECRET_SETTING => {
+                                                            if let Err(e) = reload_jwt_secret_setting(&db).await {
+                                                                tracing::error!(error = %e, "Could not reload jwt secret setting");
+                                                            }
+                                                        },
+                                                        CRITICAL_ALERT_MUTE_UI_SETTING => {
+                                                            tracing::info!("Critical alert UI setting changed");
+                                                            if let Err(e) = reload_critical_alert_mute_ui_setting(&conn).await {
+                                                                tracing::error!(error = %e, "Could not reload critical alert UI setting");
+                                                            }
+                                                        },
+                                                        a @_ => {
+                                                            tracing::info!("Unrecognized Global Setting Change Payload: {:?}", a);
+                                                        }
+                                                    }
                                                 },
                                                 _ => {
-                                                    tracing::debug!("config changed but did not target this server/worker");
+                                                    tracing::warn!("Unknown notification received");
+                                                    continue;
                                                 }
                                             }
                                         },
-                                        "notify_webhook_change" => {
-                                            let workspace_id = n.payload();
-                                            tracing::info!("Webhook change detected, invalidating webhook cache: {}", workspace_id);
-                                            windmill_api::webhook_util::WEBHOOK_CACHE.remove(workspace_id);
-                                        },
-                                        "notify_workspace_envs_change" => {
-                                            let workspace_id = n.payload();
-                                            tracing::info!("Workspace envs change detected, invalidating workspace envs cache: {}", workspace_id);
-                                            windmill_common::variables::CUSTOM_ENVS_CACHE.remove(workspace_id);
-                                        },
-                                        "notify_workspace_premium_change" => {
-                                            let workspace_id = n.payload();
-                                            tracing::info!("Workspace premium change detected, invalidating workspace premium cache: {}", workspace_id);
-                                            windmill_common::workspaces::IS_PREMIUM_CACHE.remove(workspace_id);
-                                        },
-                                        "notify_global_setting_change" => {
-                                            tracing::info!("Global setting change detected: {}", n.payload());
-                                            match n.payload() {
-                                                BASE_URL_SETTING => {
-                                                    if let Err(e) = reload_base_url_setting(&db).await {
-                                                        tracing::error!(error = %e, "Could not reload base url setting");
-                                                    }
+                                        Err(e) => {
+                                            tracing::error!(error = %e, "Could not receive notification, attempting to reconnect listener");
+                                            tokio::select! {
+                                                biased;
+                                                _ = monitor_killpill_rx.recv() => {
+                                                    tracing::info!("received killpill for monitor job");
+                                                    break;
                                                 },
-                                                OAUTH_SETTING => {
-                                                    if let Err(e) = reload_base_url_setting(&db).await {
-                                                        tracing::error!(error = %e, "Could not reload oauth setting");
-                                                    }
-                                                },
-                                                CUSTOM_TAGS_SETTING => {
-                                                    if let Err(e) = reload_custom_tags_setting(&db).await {
-                                                        tracing::error!(error = %e, "Could not reload custom tags setting");
-                                                    }
-                                                },
-                                                LICENSE_KEY_SETTING => {
-                                                    if let Err(e) = reload_license_key(&db).await {
-                                                        tracing::error!("Failed to reload license key: {e:#}");
-                                                    }
-                                                },
-                                                DEFAULT_TAGS_PER_WORKSPACE_SETTING => {
-                                                    if let Err(e) = load_tag_per_workspace_enabled(&db).await {
-                                                        tracing::error!("Error loading default tag per workspace: {e:#}");
-                                                    }
-                                                },
-                                                DEFAULT_TAGS_WORKSPACES_SETTING => {
-                                                    if let Err(e) = load_tag_per_workspace_workspaces(&db).await {
-                                                        tracing::error!("Error loading default tag per workspace workspaces: {e:#}");
-                                                    }
-                                                }
-                                                SMTP_SETTING => {
-                                                    reload_smtp_config(&db).await;
-                                                },
-                                                TEAMS_SETTING => {
-                                                    tracing::info!("Teams setting changed.");
-                                                },
-                                                INDEXER_SETTING => {
-                                                    reload_indexer_config(&db).await;
-                                                },
-                                                TIMEOUT_WAIT_RESULT_SETTING => {
-                                                    reload_timeout_wait_result_setting(&db).await
-                                                },
-                                                RETENTION_PERIOD_SECS_SETTING => {
-                                                    reload_retention_period_setting(&db).await
-                                                },
-                                                MONITOR_LOGS_ON_OBJECT_STORE_SETTING => {
-                                                    reload_delete_logs_periodically_setting(&db).await
-                                                },
-                                                JOB_DEFAULT_TIMEOUT_SECS_SETTING => {
-                                                    reload_job_default_timeout_setting(&db).await
-                                                },
-                                                #[cfg(feature = "parquet")]
-                                                OBJECT_STORE_CACHE_CONFIG_SETTING => {
-                                                    if !disable_s3_store {
-                                                        reload_s3_cache_setting(&db).await
-                                                    }
-                                                },
-                                                SCIM_TOKEN_SETTING => {
-                                                    reload_scim_token_setting(&db).await
-                                                },
-                                                EXTRA_PIP_INDEX_URL_SETTING => {
-                                                    reload_extra_pip_index_url_setting(&db).await
-                                                },
-                                                PIP_INDEX_URL_SETTING => {
-                                                    reload_pip_index_url_setting(&db).await
-                                                },
-                                                INSTANCE_PYTHON_VERSION_SETTING => {
-                                                    reload_instance_python_version_setting(&db).await
-                                                },
-                                                NPM_CONFIG_REGISTRY_SETTING => {
-                                                    reload_npm_config_registry_setting(&db).await
-                                                },
-                                                BUNFIG_INSTALL_SCOPES_SETTING => {
-                                                    reload_bunfig_install_scopes_setting(&db).await
-                                                },
-                                                NUGET_CONFIG_SETTING => {
-                                                    reload_nuget_config_setting(&db).await
-                                                },
-                                                KEEP_JOB_DIR_SETTING => {
-                                                    load_keep_job_dir(&db).await;
-                                                },
-                                                REQUIRE_PREEXISTING_USER_FOR_OAUTH_SETTING => {
-                                                    load_require_preexisting_user(&db).await;
-                                                },
-                                                EXPOSE_METRICS_SETTING  => {
-                                                    tracing::info!("Metrics setting changed, restarting");
-                                                    send_delayed_killpill(&tx, 40, "metrics setting change").await;
-                                                },
-                                                EMAIL_DOMAIN_SETTING => {
-                                                    tracing::info!("Email domain setting changed");
-                                                    if server_mode {
-                                                        send_delayed_killpill(&tx, 4, "email domain setting change").await;
-                                                    }
-                                                },
-                                                EXPOSE_DEBUG_METRICS_SETTING => {
-                                                    if let Err(e) = load_metrics_debug_enabled(&db).await {
-                                                        tracing::error!(error = %e, "Could not reload debug metrics setting");
-                                                    }
-                                                },
-                                                OTEL_SETTING => {
-                                                    tracing::info!("OTEL setting changed, restarting");
-                                                    send_delayed_killpill(&tx, 4, "OTEL setting change").await;
-                                                },
-                                                REQUEST_SIZE_LIMIT_SETTING => {
-                                                    if server_mode {
-                                                        tracing::info!("Request limit size change detected, killing server expecting to be restarted");
-                                                        send_delayed_killpill(&tx, 4, "request size limit change").await;
-                                                    }
-                                                },
-                                                SAML_METADATA_SETTING => {
-                                                    tracing::info!("SAML metadata change detected, killing server expecting to be restarted");
-                                                    send_delayed_killpill(&tx, 0, "SAML metadata change").await;
-                                                },
-                                                HUB_BASE_URL_SETTING => {
-                                                    if let Err(e) = reload_hub_base_url_setting(&db, server_mode).await {
-                                                        tracing::error!(error = %e, "Could not reload hub base url setting");
-                                                    }
-                                                },
-                                                CRITICAL_ERROR_CHANNELS_SETTING => {
-                                                    if let Err(e) = reload_critical_error_channels_setting(&db).await {
-                                                        tracing::error!(error = %e, "Could not reload critical error emails setting");
-                                                    }
-                                                },
-                                                JWT_SECRET_SETTING => {
-                                                    if let Err(e) = reload_jwt_secret_setting(&db).await {
-                                                        tracing::error!(error = %e, "Could not reload jwt secret setting");
-                                                    }
-                                                },
-                                                CRITICAL_ALERT_MUTE_UI_SETTING => {
-                                                    tracing::info!("Critical alert UI setting changed");
-                                                    if let Err(e) = reload_critical_alert_mute_ui_setting(&db).await {
-                                                        tracing::error!(error = %e, "Could not reload critical alert UI setting");
-                                                    }
-                                                },
-                                                a @_ => {
-                                                    tracing::info!("Unrecognized Global Setting Change Payload: {:?}", a);
+                                                new_listener = retry_listen_pg(&db_url) => {
+                                                    listener = new_listener;
+                                                    continue;
                                                 }
                                             }
-                                        },
-                                        _ => {
-                                            tracing::warn!("Unknown notification received");
-                                            continue;
                                         }
+                                    };
+                                },
+                                _ = tokio::time::sleep(Duration::from_secs(30))    => {
+                                    if last_listener_refresh.elapsed() > Duration::from_secs(*PG_LISTENER_REFRESH_PERIOD_SECS) {
+                                        tracing::info!("Refreshing pg listeners, settings and license key after {}s", Duration::from_secs(*PG_LISTENER_REFRESH_PERIOD_SECS).as_secs());
+                                        if let Err(e) = listener.unlisten_all().await {
+                                            tracing::error!(error = %e, "Could not unlisten to database");
+                                        }
+                                        listener = retry_listen_pg(&db_url).await;
+                                        initial_load(
+                                            &conn,
+                                            tx.clone(),
+                                            worker_mode,
+                                            server_mode,
+                                            #[cfg(feature = "parquet")]
+                                            disable_s3_store,
+                                        )
+                                        .await;
+                                        #[cfg(feature = "enterprise")]
+                                        if let Err(err) = reload_license_key(&conn).await {
+                                            tracing::error!("Failed to reload license key: {err:#}");
+                                        }
+                                        last_listener_refresh = Instant::now();
+                                    }
+
+                                    if server_mode {
+                                        tracing::info!("monitor task started");
+                                    }
+                                    monitor_db(
+                                        &conn,
+                                        &base_internal_url,
+                                        server_mode,
+                                        worker_mode,
+                                        false,
+                                        tx.clone(),
+                                    )
+                                    .await;
+                                    if server_mode {
+                                        tracing::info!("monitor task finished");
                                     }
                                 },
-                                Err(e) => {
-                                    tracing::error!(error = %e, "Could not receive notification, attempting to reconnect listener");
-                                    tokio::select! {
-                                        biased;
-                                        _ = monitor_killpill_rx.recv() => {
-                                            tracing::info!("received killpill for monitor job");
-                                            break;
-                                        },
-                                        new_listener = retry_listen_pg(&db_url) => {
-                                            listener = new_listener;
-                                            continue;
-                                        }
-                                    }
-                                }
-                            };
-                        },
-                        _ = tokio::time::sleep(Duration::from_secs(30))    => {
-                            if last_listener_refresh.elapsed() > Duration::from_secs(*PG_LISTENER_REFRESH_PERIOD_SECS) {
-                                tracing::info!("Refreshing pg listeners, settings and license key after {}s", Duration::from_secs(*PG_LISTENER_REFRESH_PERIOD_SECS).as_secs());
-                                if let Err(e) = listener.unlisten_all().await {
-                                    tracing::error!(error = %e, "Could not unlisten to database");
-                                }
-                                listener = retry_listen_pg(&db_url).await;
-                                initial_load(
-                                    &db,
-                                    tx.clone(),
-                                    worker_mode,
-                                    server_mode,
-                                    #[cfg(feature = "parquet")]
-                                    disable_s3_store,
-                                )
-                                .await;
-                                #[cfg(feature = "enterprise")]
-                                if let Err(err) = reload_license_key(&db).await {
-                                    tracing::error!("Failed to reload license key: {err:#}");
-                                }
-                                last_listener_refresh = Instant::now();
                             }
+                        }
+                    });
 
-                            if server_mode {
-                                tracing::info!("monitor task started");
-                            }
-                            monitor_db(
-                                &db,
-                                &base_internal_url,
-                                server_mode,
-                                worker_mode,
-                                false,
-                                tx.clone(),
-                            )
-                            .await;
-                            if server_mode {
-                                tracing::info!("monitor task finished");
-                            }
-                        },
+                    if let Err(e) = h.await {
+                        tracing::error!("Error waiting for monitor handle: {e:#}")
                     }
                 }
-            });
+                Connection::Http => loop {
+                    tokio::select! {
+                        _ = monitor_killpill_rx.recv() => {
+                            tracing::info!("Received killpill, exiting");
+                            break;
+                        },
+                        _ = tokio::time::sleep(Duration::from_secs(12 * 60 * 60)) => {
+                            tracing::info!("Reloading config after 12 hours");
+                            initial_load(&conn, tx.clone(), worker_mode, server_mode, #[cfg(feature = "parquet")] disable_s3_store).await;
+                            #[cfg(feature = "enterprise")]
+                            verify_license_key().await;
+                        }
+                    }
+                },
+            };
 
-            if let Err(e) = h.await {
-                tracing::error!("Error waiting for monitor handle: {e:#}")
-            }
             tracing::info!("Monitor exited");
             killpill_tx.send();
             Ok(()) as anyhow::Result<()>
@@ -1009,7 +1031,9 @@ Windmill Community Edition {GIT_VERSION}
         };
 
         if server_mode {
-            schedule_stats(&db, &HTTP_CLIENT).await;
+            if let Some(db) = conn.as_sql() {
+                schedule_stats(&db, &HTTP_CLIENT).await;
+            }
         }
 
         futures::try_join!(
@@ -1024,15 +1048,17 @@ Windmill Community Edition {GIT_VERSION}
     } else {
         tracing::info!("Nothing to do, exiting.");
     }
-    send_current_log_file_to_object_store(&db, &hostname, &mode).await;
+    send_current_log_file_to_object_store(&conn, &hostname, &mode).await;
 
-    tracing::info!("Exiting connection pool");
-    tokio::select! {
-        _ = db.close() => {
-            tracing::info!("Database connection pool closed");
-        },
-        _ = tokio::time::sleep(Duration::from_secs(15)) => {
-            tracing::warn!("Could not close database connection pool in time (15s). Exiting anyway.");
+    if let Some(db) = conn.as_sql() {
+        tracing::info!("Exiting connection pool");
+        tokio::select! {
+            _ = db.close() => {
+                tracing::info!("Database connection pool closed");
+            },
+            _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                tracing::warn!("Could not close database connection pool in time (15s). Exiting anyway.");
+            }
         }
     }
     Ok(())

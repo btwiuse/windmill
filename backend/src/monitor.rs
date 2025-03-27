@@ -121,28 +121,32 @@ pub async fn initial_load(
     server_mode: bool,
     #[cfg(feature = "parquet")] disable_s3_store: bool,
 ) {
-    if let Err(e) = load_metrics_enabled(db).await {
+    if let Err(e) = load_metrics_enabled(conn).await {
         tracing::error!("Error loading expose metrics: {e:#}");
     }
 
-    if let Err(e) = load_metrics_debug_enabled(db).await {
+    if let Err(e) = load_metrics_debug_enabled(conn).await {
         tracing::error!("Error loading expose debug metrics: {e:#}");
     }
 
-    if let Err(e) = reload_critical_alert_mute_ui_setting(db).await {
+    if let Err(e) = reload_critical_alert_mute_ui_setting(conn).await {
         tracing::error!("Error loading critical alert mute ui setting: {e:#}");
     }
 
-    if let Err(e) = load_tag_per_workspace_enabled(db).await {
-        tracing::error!("Error loading default tag per workpsace: {e:#}");
-    }
+    if let Some(db) = conn.as_sql() {
+        if let Err(e) = load_tag_per_workspace_enabled(db).await {
+            tracing::error!("Error loading default tag per workpsace: {e:#}");
+        }
 
-    if let Err(e) = load_tag_per_workspace_workspaces(db).await {
-        tracing::error!("Error loading default tag per workpsace workspaces: {e:#}");
+        if let Err(e) = load_tag_per_workspace_workspaces(db).await {
+            tracing::error!("Error loading default tag per workpsace workspaces: {e:#}");
+        }
     }
 
     if server_mode {
-        load_require_preexisting_user(db).await;
+        if let Some(db) = conn.as_sql() {
+            load_require_preexisting_user(db).await;
+        }
     }
 
     if worker_mode {
@@ -196,8 +200,8 @@ pub async fn initial_load(
     }
 }
 
-pub async fn load_metrics_enabled(db: &DB) -> error::Result<()> {
-    let metrics_enabled = load_value_from_global_settings(db, EXPOSE_METRICS_SETTING).await;
+pub async fn load_metrics_enabled(conn: &Connection) -> error::Result<()> {
+    let metrics_enabled = load_value_from_global_settings_with_conn(conn, EXPOSE_METRICS_SETTING, true).await;
     match metrics_enabled {
         Ok(Some(serde_json::Value::Bool(t))) => METRICS_ENABLED.store(t, Ordering::Relaxed),
         _ => (),
@@ -320,26 +324,18 @@ pub async fn load_tag_per_workspace_workspaces(db: &DB) -> error::Result<()> {
     Ok(())
 }
 
-pub async fn reload_critical_alert_mute_ui_setting(db: &DB) -> error::Result<()> {
+pub async fn reload_critical_alert_mute_ui_setting(conn: &Connection) -> error::Result<()> {
     if let Ok(Some(serde_json::Value::Bool(t))) =
-        load_value_from_global_settings(db, CRITICAL_ALERT_MUTE_UI_SETTING).await
+        load_value_from_global_settings_with_conn(conn, CRITICAL_ALERT_MUTE_UI_SETTING, true).await
     {
         CRITICAL_ALERT_MUTE_UI_ENABLED.store(t, Ordering::Relaxed);
 
-        if t {
-            if let Err(e) = sqlx::query!("UPDATE alerts SET acknowledged = true")
-                .execute(db)
-                .await
-            {
-                tracing::error!("Error updating alerts: {}", e.to_string());
-            }
-        }
     }
     Ok(())
 }
 
-pub async fn load_metrics_debug_enabled(db: &DB) -> error::Result<()> {
-    let metrics_enabled = load_value_from_global_settings(db, EXPOSE_DEBUG_METRICS_SETTING).await;
+pub async fn load_metrics_debug_enabled(conn: &Connection) -> error::Result<()> {
+    let metrics_enabled = load_value_from_global_settings_with_conn(conn, EXPOSE_DEBUG_METRICS_SETTING, true).await;
     match metrics_enabled {
         Ok(Some(serde_json::Value::Bool(t))) => {
             METRICS_DEBUG_ENABLED.store(t, Ordering::Relaxed);
@@ -490,7 +486,7 @@ fn get_worker_group(mode: &Mode) -> Option<String> {
     }
 }
 
-pub fn send_logs_to_object_store(conn: &DB, hostname: &str, mode: &Mode) {
+pub fn send_logs_to_object_store(conn: &Connection, hostname: &str, mode: &Mode) {
     let conn = conn.clone();
     let hostname = hostname.to_string();
     let mode = mode.clone();
@@ -515,11 +511,11 @@ pub fn send_logs_to_object_store(conn: &DB, hostname: &str, mode: &Mode) {
     });
 }
 
-pub async fn send_current_log_file_to_object_store(db: &DB, hostname: &str, mode: &Mode) {
+pub async fn send_current_log_file_to_object_store(conn: &Connection, hostname: &str, mode: &Mode) {
     tracing::info!("Sending current log file to object store");
     let (highest_file, _) = find_two_highest_files(hostname).await;
     let worker_group = get_worker_group(&mode);
-    send_log_file_to_object_store(hostname, mode, &worker_group, db, highest_file, true).await;
+    send_log_file_to_object_store(hostname, mode, &worker_group, conn, highest_file, true).await;
 }
 
 fn get_now_and_str() -> (NaiveDateTime, String) {
@@ -539,7 +535,7 @@ async fn send_log_file_to_object_store(
     hostname: &str,
     mode: &Mode,
     worker_group: &Option<String>,
-    db: &Pool<Postgres,
+    conn: &Connection,
     snd_highest_file: Option<String>,
     use_now: bool,
 ) {
@@ -599,6 +595,7 @@ async fn send_log_file_to_object_store(
 
         let (ok_lines, err_lines) = read_log_counters(ts_str);
 
+        if let Some(db) = conn.as_sql() {
         if let Err(e) = sqlx::query!("INSERT INTO log_file (hostname, mode, worker_group, log_ts, file_path, ok_lines, err_lines, json_fmt) VALUES ($1, $2::text::LOG_MODE, $3, $4, $5, $6, $7, $8)", 
             hostname, mode.to_string(), worker_group.clone(), ts, highest_file, ok_lines as i64, err_lines as i64, *JSON_FMT)
             .execute(db)
@@ -610,7 +607,10 @@ async fn send_log_file_to_object_store(
             }) {
                 tracing::error!("Error updating last log file sent: {:?}", e);
             }
-            tracing::info!("Log file sent: {}", highest_file);
+                tracing::info!("Log file sent: {}", highest_file);
+            }
+        } else {
+            tracing::error!("Sending log file to object store but no database connection");
         }
     }
 }
